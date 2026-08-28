@@ -11,6 +11,8 @@ permissions:
 jobs:
   check-signals:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
     steps:
       - name: Récupérer le dépôt
         uses: actions/checkout@v4
@@ -28,7 +30,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-        run: python xauusd_github_actions.py
+        run: python -u xauusd_github_actions.py
 
       - name: Sauvegarder l'état (state.json) dans le dépôt
         run: |
