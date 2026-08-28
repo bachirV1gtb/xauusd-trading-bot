@@ -1,0 +1,1 @@
+# xauusd-trading-bot
