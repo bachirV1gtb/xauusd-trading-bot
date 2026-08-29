@@ -54,6 +54,7 @@ ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 ATR_TP1_MULTIPLIER = 1.0
 ATR_TP2_MULTIPLIER = 2.5
+ATR_MIN_THRESHOLD = 0.5  # en dessous de ça (marché quasi plat), on ignore les signaux
 
 STATE_FILE = "state.json"
 
@@ -123,7 +124,12 @@ def fetch_candles():
             log(f"Réponse inattendue de Twelve Data (pas de 'values') : {data}")
             return None
         candles = [
-            {"high": float(c["high"]), "low": float(c["low"]), "close": float(c["close"])}
+            {
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "datetime": c["datetime"],
+            }
             for c in reversed(data["values"])
         ]
         log(f"{len(candles)} bougies récupérées avec succès.")
@@ -203,11 +209,17 @@ def run_once():
     state = load_state()
     last_sma_signal = state.get("last_sma_signal")
     last_rsi_zone = state.get("last_rsi_zone")
-    log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}")
+    last_candle_time = state.get("last_candle_time")
+    log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, last_candle_time={last_candle_time}")
 
     candles = fetch_candles()
     if candles is None or len(candles) < max(LONG_WINDOW, RSI_PERIOD + 1):
         log("Pas assez de données pour calculer les indicateurs, on arrête ici.")
+        return
+
+    current_candle_time = candles[-1]["datetime"]
+    if last_candle_time is not None and current_candle_time == last_candle_time:
+        log(f"Aucune nouvelle bougie depuis la dernière vérification (marché probablement fermé — {current_candle_time}). On arrête ici, pas de recalcul.")
         return
 
     closes = [c["close"] for c in candles]
@@ -215,6 +227,15 @@ def run_once():
     atr = average_true_range(candles, ATR_PERIOD)
     if atr is None:
         log("ATR non calculable, on arrête ici.")
+        return
+
+    if atr < ATR_MIN_THRESHOLD:
+        log(f"ATR trop faible ({atr:.3f} < {ATR_MIN_THRESHOLD}) — marché quasi plat, signaux ignorés pour éviter le bruit.")
+        save_state({
+            "last_sma_signal": last_sma_signal,
+            "last_rsi_zone": last_rsi_zone,
+            "last_candle_time": current_candle_time,
+        })
         return
 
     alerts_sent = 0
@@ -258,7 +279,11 @@ def run_once():
     if alerts_sent == 0:
         log("Aucun changement détecté, pas d'alerte envoyée.")
 
-    save_state({"last_sma_signal": last_sma_signal, "last_rsi_zone": last_rsi_zone})
+    save_state({
+        "last_sma_signal": last_sma_signal,
+        "last_rsi_zone": last_rsi_zone,
+        "last_candle_time": current_candle_time,
+    })
     log("=== Fin de la vérification, état sauvegardé ===")
 
 
