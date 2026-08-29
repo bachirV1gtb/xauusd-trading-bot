@@ -56,6 +56,9 @@ ATR_TP1_MULTIPLIER = 1.0
 ATR_TP2_MULTIPLIER = 2.5
 ATR_MIN_THRESHOLD = 0.5  # en dessous de ça (marché quasi plat), on ignore les signaux
 
+# --- Configuration du suivi de position (pips) ---
+PIP_SIZE = 0.1  # 1 pip = 0.1 sur XAU/USD
+
 STATE_FILE = "state.json"
 
 
@@ -197,6 +200,60 @@ def compute_tp_sl(action: str, entry_price: float, atr: float):
     return tp1, tp2, stop_loss
 
 
+def pips_between(price_a: float, price_b: float) -> int:
+    """Calcule l'écart entre deux prix en pips (1 pip = PIP_SIZE)."""
+    return round(abs(price_a - price_b) / PIP_SIZE)
+
+
+def format_tp_hit(level_name: str, entry: float, level_price: float) -> str:
+    pips = pips_between(entry, level_price)
+    return f"🎯 {level_name} TOUCHÉ 🔥\n{SYMBOL} +{pips} pips ✅"
+
+
+def format_sl_hit(entry: float, sl_price: float) -> str:
+    pips = pips_between(entry, sl_price)
+    return f"🔒 SL TOUCHÉ ❌\n{SYMBOL} -{pips} pips"
+
+
+def check_open_trade(current_price: float, open_trade: dict):
+    """
+    Vérifie si le prix actuel a atteint TP1, TP2 ou le SL de la position ouverte.
+    Renvoie (messages_a_envoyer, open_trade_mis_a_jour).
+    """
+    if open_trade is None or open_trade.get("closed"):
+        return [], open_trade
+
+    messages = []
+    action = open_trade["action"]
+    entry = open_trade["entry"]
+    tp1, tp2, sl = open_trade["tp1"], open_trade["tp2"], open_trade["sl"]
+
+    if action == "BUY":
+        if not open_trade.get("closed") and current_price <= sl:
+            messages.append(format_sl_hit(entry, sl))
+            open_trade["closed"] = True
+        else:
+            if not open_trade.get("tp1_hit") and current_price >= tp1:
+                messages.append(format_tp_hit("TP1", entry, tp1))
+                open_trade["tp1_hit"] = True
+            if not open_trade.get("tp2_hit") and current_price >= tp2:
+                messages.append(format_tp_hit("TP2", entry, tp2))
+                open_trade["tp2_hit"] = True
+    else:  # SELL
+        if not open_trade.get("closed") and current_price >= sl:
+            messages.append(format_sl_hit(entry, sl))
+            open_trade["closed"] = True
+        else:
+            if not open_trade.get("tp1_hit") and current_price <= tp1:
+                messages.append(format_tp_hit("TP1", entry, tp1))
+                open_trade["tp1_hit"] = True
+            if not open_trade.get("tp2_hit") and current_price <= tp2:
+                messages.append(format_tp_hit("TP2", entry, tp2))
+                open_trade["tp2_hit"] = True
+
+    return messages, open_trade
+
+
 def run_once():
     log("=== Démarrage de la vérification ===")
 
@@ -210,7 +267,8 @@ def run_once():
     last_sma_signal = state.get("last_sma_signal")
     last_rsi_zone = state.get("last_rsi_zone")
     last_candle_time = state.get("last_candle_time")
-    log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, last_candle_time={last_candle_time}")
+    open_trade = state.get("open_trade")
+    log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, last_candle_time={last_candle_time}, position ouverte={'oui' if open_trade and not open_trade.get('closed') else 'non'}")
 
     candles = fetch_candles()
     if candles is None or len(candles) < max(LONG_WINDOW, RSI_PERIOD + 1):
@@ -224,9 +282,22 @@ def run_once():
 
     closes = [c["close"] for c in candles]
     current_price = closes[-1]
+
+    # --- Vérification de la position ouverte (TP1/TP2/SL) ---
+    trade_messages, open_trade = check_open_trade(current_price, open_trade)
+    for msg in trade_messages:
+        sent = send_alert(msg)
+        log(f"Alerte position envoyée ({msg.splitlines()[0]}) : {sent}")
+
     atr = average_true_range(candles, ATR_PERIOD)
     if atr is None:
         log("ATR non calculable, on arrête ici.")
+        save_state({
+            "last_sma_signal": last_sma_signal,
+            "last_rsi_zone": last_rsi_zone,
+            "last_candle_time": current_candle_time,
+            "open_trade": open_trade,
+        })
         return
 
     if atr < ATR_MIN_THRESHOLD:
@@ -235,6 +306,7 @@ def run_once():
             "last_sma_signal": last_sma_signal,
             "last_rsi_zone": last_rsi_zone,
             "last_candle_time": current_candle_time,
+            "open_trade": open_trade,
         })
         return
 
@@ -253,6 +325,16 @@ def run_once():
             sent = send_alert(message)
             log(f"Alerte SMA envoyée : {sent}")
             alerts_sent += 1
+            open_trade = {
+                "action": current_sma_signal,
+                "entry": current_price,
+                "tp1": tp1,
+                "tp2": tp2,
+                "sl": stop_loss,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "closed": False,
+            }
         last_sma_signal = current_sma_signal
 
     # --- Signal 2 : sortie de zone RSI ---
@@ -267,6 +349,16 @@ def run_once():
             sent = send_alert(message)
             log(f"Alerte RSI (BUY) envoyée : {sent}")
             alerts_sent += 1
+            open_trade = {
+                "action": "BUY",
+                "entry": current_price,
+                "tp1": tp1,
+                "tp2": tp2,
+                "sl": stop_loss,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "closed": False,
+            }
         elif last_rsi_zone == "overbought" and current_zone == "neutral":
             tp1, tp2, stop_loss = compute_tp_sl("SELL", current_price, atr)
             note = f"Signal : RSI sort de surachat (RSI={rsi:.1f})"
@@ -274,6 +366,16 @@ def run_once():
             sent = send_alert(message)
             log(f"Alerte RSI (SELL) envoyée : {sent}")
             alerts_sent += 1
+            open_trade = {
+                "action": "SELL",
+                "entry": current_price,
+                "tp1": tp1,
+                "tp2": tp2,
+                "sl": stop_loss,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "closed": False,
+            }
         last_rsi_zone = current_zone
 
     if alerts_sent == 0:
@@ -283,6 +385,7 @@ def run_once():
         "last_sma_signal": last_sma_signal,
         "last_rsi_zone": last_rsi_zone,
         "last_candle_time": current_candle_time,
+        "open_trade": open_trade,
     })
     log("=== Fin de la vérification, état sauvegardé ===")
 
