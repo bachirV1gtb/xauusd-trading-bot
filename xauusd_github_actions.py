@@ -32,8 +32,12 @@ def log(message):
 # --- Configuration Telegram ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # optionnel : alertes privées de panne
 TELEGRAM_SEND_MESSAGE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 TELEGRAM_SEND_PHOTO_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+
+# --- Configuration de la surveillance de panne ---
+FAILURE_ALERT_THRESHOLD = 3  # nombre d'échecs consécutifs avant d'alerter l'admin
 
 # --- Configuration Twelve Data ---
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
@@ -76,6 +80,8 @@ def load_state():
         "open_trade": None,
         "weekly_trades": [],
         "last_summary_week": None,
+        "consecutive_failures": 0,
+        "admin_alerted_for_streak": False,
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -93,6 +99,25 @@ def save_state(state: dict):
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
+
+
+def send_admin_alert(message: str) -> bool:
+    """Envoie un message privé à l'administrateur (toi), séparé du canal public."""
+    if not ADMIN_CHAT_ID:
+        log("ADMIN_CHAT_ID non configuré, alerte de panne non envoyée (mais consignée dans les logs).")
+        return False
+    payload = {
+        "chat_id": ADMIN_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+    }
+    try:
+        response = requests.post(TELEGRAM_SEND_MESSAGE_URL, data=payload, timeout=10)
+        response.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        log(f"[{datetime.now(timezone.utc)}] Erreur envoi alerte admin : {e}")
+        return False
 
 
 def send_alert(message: str) -> bool:
@@ -425,7 +450,32 @@ def run_once():
     candles = fetch_candles()
     if candles is None or len(candles) < max(LONG_WINDOW, RSI_PERIOD + 1):
         log("Pas assez de données pour calculer les indicateurs, on arrête ici.")
+        consecutive_failures = state.get("consecutive_failures", 0) + 1
+        admin_alerted = state.get("admin_alerted_for_streak", False)
+        log(f"Échecs consécutifs : {consecutive_failures}")
+        if consecutive_failures >= FAILURE_ALERT_THRESHOLD and not admin_alerted:
+            alert_msg = (
+                f"⚠️ <b>XAU Guardian — Problème détecté</b>\n\n"
+                f"Le bot n'arrive plus à récupérer les prix depuis {consecutive_failures} exécutions consécutives.\n"
+                f"Vérifie ton quota Twelve Data ou les logs GitHub Actions."
+            )
+            send_admin_alert(alert_msg)
+            admin_alerted = True
+            log("Alerte de panne envoyée à l'admin.")
+        save_state({
+            **state,
+            "consecutive_failures": consecutive_failures,
+            "admin_alerted_for_streak": admin_alerted,
+        })
         return
+
+    # Récupération réussie : on remet le compteur d'échecs à zéro
+    if state.get("consecutive_failures", 0) > 0:
+        log("Récupération des données réussie après une série d'échecs — compteur remis à zéro.")
+        if state.get("admin_alerted_for_streak"):
+            send_admin_alert("✅ XAU Guardian — Le bot fonctionne à nouveau normalement.")
+    state["consecutive_failures"] = 0
+    state["admin_alerted_for_streak"] = False
 
     current_candle_time = candles[-1]["datetime"]
     if last_candle_time is not None and current_candle_time == last_candle_time:
@@ -447,24 +497,24 @@ def run_once():
     if atr is None:
         log("ATR non calculable, on arrête ici.")
         save_state({
+            **state,
             "last_sma_signal": last_sma_signal,
             "last_rsi_zone": last_rsi_zone,
             "last_candle_time": current_candle_time,
             "open_trade": open_trade,
             "weekly_trades": weekly_trades,
-            "last_summary_week": state.get("last_summary_week"),
         })
         return
 
     if atr < ATR_MIN_THRESHOLD:
         log(f"ATR trop faible ({atr:.3f} < {ATR_MIN_THRESHOLD}) — marché quasi plat, signaux ignorés pour éviter le bruit.")
         save_state({
+            **state,
             "last_sma_signal": last_sma_signal,
             "last_rsi_zone": last_rsi_zone,
             "last_candle_time": current_candle_time,
             "open_trade": open_trade,
             "weekly_trades": weekly_trades,
-            "last_summary_week": state.get("last_summary_week"),
         })
         return
 
@@ -543,12 +593,12 @@ def run_once():
         log("Aucun changement détecté, pas d'alerte envoyée.")
 
     save_state({
+        **state,
         "last_sma_signal": last_sma_signal,
         "last_rsi_zone": last_rsi_zone,
         "last_candle_time": current_candle_time,
         "open_trade": open_trade,
         "weekly_trades": weekly_trades,
-        "last_summary_week": state.get("last_summary_week"),
     })
     log("=== Fin de la vérification, état sauvegardé ===")
 
@@ -560,3 +610,4 @@ if __name__ == "__main__":
         log("=== ERREUR INATTENDUE ===")
         log(traceback.format_exc())
         sys.exit(1)
+        

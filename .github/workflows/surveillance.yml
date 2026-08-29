@@ -30,6 +30,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
         run: python -u xauusd_github_actions.py
 
       - name: Sauvegarder l'état (state.json) dans le dépôt
