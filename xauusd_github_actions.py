@@ -1,17 +1,13 @@
 """
-Script d'alertes de trading XAUUSD vers Telegram — version GitHub Actions (v2, corrigée).
+Script d'alertes de trading XAUUSD vers Telegram — version GitHub Actions (v3).
 Deux sources de signaux : croisement SMA5/13 + sortie de zone RSI14.
-
-Corrections dans cette version :
-- Tous les print() forcent un flush immédiat (flush=True), pour éviter que
-  GitHub Actions "avale" les logs à cause de la mise en mémoire tampon.
-- Toute erreur inattendue est désormais capturée et affichée avec son
-  message complet, au lieu de disparaître silencieusement.
+Suivi des positions (TP1/TP2/SL touchés) + bilan hebdomadaire en image
+envoyé automatiquement à la clôture du marché (vendredi soir, ~21h UTC).
 
 Différences avec la version "PC" :
 - S'exécute UNE SEULE FOIS par lancement (GitHub Actions le relance périodiquement).
-- Les derniers états (SMA + RSI) sont sauvegardés dans state.json, qui doit être
-  commité dans le dépôt entre deux exécutions pour garder la mémoire.
+- L'état complet (SMA, RSI, position ouverte, historique de la semaine) est
+  sauvegardé dans state.json, commité dans le dépôt entre deux exécutions.
 - BOT_TOKEN, TWELVEDATA_API_KEY et CHANNEL_ID sont lus depuis les variables
   d'environnement (GitHub Secrets), jamais écrits en clair dans ce fichier.
 """
@@ -23,16 +19,21 @@ import traceback
 import requests
 from datetime import datetime, timezone
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 
 def log(message):
     """Affiche un message en forçant l'affichage immédiat (anti-buffering)."""
     print(message, flush=True)
 
 
-# --- Configuration Telegram (lue depuis les variables d'environnement) ---
+# --- Configuration Telegram ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+TELEGRAM_SEND_MESSAGE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+TELEGRAM_SEND_PHOTO_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
 
 # --- Configuration Twelve Data ---
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
@@ -59,17 +60,33 @@ ATR_MIN_THRESHOLD = 0.5  # en dessous de ça (marché quasi plat), on ignore les
 # --- Configuration du suivi de position (pips) ---
 PIP_SIZE = 0.1  # 1 pip = 0.1 sur XAU/USD
 
+# --- Configuration du bilan hebdomadaire ---
+WEEKLY_SUMMARY_WEEKDAY = 4   # 0=lundi ... 4=vendredi
+WEEKLY_SUMMARY_HOUR_UTC = 21  # heure UTC à partir de laquelle on considère le marché fermé
+
 STATE_FILE = "state.json"
+SUMMARY_IMAGE_PATH = "weekly_summary.png"
 
 
 def load_state():
+    default = {
+        "last_sma_signal": None,
+        "last_rsi_zone": None,
+        "last_candle_time": None,
+        "open_trade": None,
+        "weekly_trades": [],
+        "last_summary_week": None,
+    }
     if not os.path.exists(STATE_FILE):
-        return {"last_sma_signal": None, "last_rsi_zone": None}
+        return default
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            for k, v in default.items():
+                data.setdefault(k, v)
+            return data
     except (json.JSONDecodeError, OSError):
-        return {"last_sma_signal": None, "last_rsi_zone": None}
+        return default
 
 
 def save_state(state: dict):
@@ -86,11 +103,24 @@ def send_alert(message: str) -> bool:
         "disable_web_page_preview": True,
     }
     try:
-        response = requests.post(TELEGRAM_API_URL, data=payload, timeout=10)
+        response = requests.post(TELEGRAM_SEND_MESSAGE_URL, data=payload, timeout=10)
         response.raise_for_status()
         return True
     except requests.RequestException as e:
-        log(f"[{datetime.now(timezone.utc)}] Erreur envoi Telegram : {e}")
+        log(f"[{datetime.now(timezone.utc)}] Erreur envoi Telegram (message) : {e}")
+        return False
+
+
+def send_photo(image_path: str, caption: str) -> bool:
+    try:
+        with open(image_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": CHANNEL_ID, "caption": caption, "parse_mode": "HTML"}
+            response = requests.post(TELEGRAM_SEND_PHOTO_URL, data=data, files=files, timeout=30)
+        response.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        log(f"[{datetime.now(timezone.utc)}] Erreur envoi Telegram (photo) : {e}")
         return False
 
 
@@ -218,12 +248,14 @@ def format_sl_hit(entry: float, sl_price: float) -> str:
 def check_open_trade(current_price: float, open_trade: dict):
     """
     Vérifie si le prix actuel a atteint TP1, TP2 ou le SL de la position ouverte.
-    Renvoie (messages_a_envoyer, open_trade_mis_a_jour).
+    Renvoie (messages_a_envoyer, open_trade_mis_a_jour, evenements_pips).
+    evenements_pips est une liste de tuples (label, pips_signes) pour le suivi hebdo.
     """
     if open_trade is None or open_trade.get("closed"):
-        return [], open_trade
+        return [], open_trade, []
 
     messages = []
+    events = []
     action = open_trade["action"]
     entry = open_trade["entry"]
     tp1, tp2, sl = open_trade["tp1"], open_trade["tp2"], open_trade["sl"]
@@ -231,27 +263,124 @@ def check_open_trade(current_price: float, open_trade: dict):
     if action == "BUY":
         if not open_trade.get("closed") and current_price <= sl:
             messages.append(format_sl_hit(entry, sl))
+            events.append(("SL", -pips_between(entry, sl)))
             open_trade["closed"] = True
         else:
             if not open_trade.get("tp1_hit") and current_price >= tp1:
                 messages.append(format_tp_hit("TP1", entry, tp1))
+                events.append(("TP1", pips_between(entry, tp1)))
                 open_trade["tp1_hit"] = True
             if not open_trade.get("tp2_hit") and current_price >= tp2:
                 messages.append(format_tp_hit("TP2", entry, tp2))
+                events.append(("TP2", pips_between(entry, tp2)))
                 open_trade["tp2_hit"] = True
     else:  # SELL
         if not open_trade.get("closed") and current_price >= sl:
             messages.append(format_sl_hit(entry, sl))
+            events.append(("SL", -pips_between(entry, sl)))
             open_trade["closed"] = True
         else:
             if not open_trade.get("tp1_hit") and current_price <= tp1:
                 messages.append(format_tp_hit("TP1", entry, tp1))
+                events.append(("TP1", pips_between(entry, tp1)))
                 open_trade["tp1_hit"] = True
             if not open_trade.get("tp2_hit") and current_price <= tp2:
                 messages.append(format_tp_hit("TP2", entry, tp2))
+                events.append(("TP2", pips_between(entry, tp2)))
                 open_trade["tp2_hit"] = True
 
-    return messages, open_trade
+    return messages, open_trade, events
+
+
+def get_week_id(dt: datetime) -> str:
+    """Identifiant unique de semaine ISO (année + numéro de semaine)."""
+    iso = dt.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def generate_summary_image(week_id: str, trades: list) -> str:
+    """Génère l'image de bilan hebdomadaire avec Matplotlib et renvoie son chemin."""
+    total_pips = sum(p for _, p in trades)
+    n_tp1 = sum(1 for label, _ in trades if label == "TP1")
+    n_tp2 = sum(1 for label, _ in trades if label == "TP2")
+    n_sl = sum(1 for label, _ in trades if label == "SL")
+    n_wins = n_tp1 + n_tp2
+    n_total = len(trades)
+    win_rate = (n_wins / n_total * 100) if n_total else 0
+
+    bg = "#0d0f16"
+    gold = "#c6a34e"
+    green = "#2ecc71"
+    red = "#e74c3c"
+    white = "#e8ecf2"
+    grey = "#8a93a3"
+
+    fig, ax = plt.subplots(figsize=(8, 8), facecolor=bg)
+    ax.set_facecolor(bg)
+    ax.axis("off")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    # Petit badge triangulaire doré au-dessus du titre
+    ax.plot([0.485, 0.515, 0.455, 0.485], [0.985, 0.945, 0.945, 0.985], color=gold, linewidth=2, transform=ax.transAxes)
+    ax.fill([0.485, 0.515, 0.455], [0.985, 0.945, 0.945], color=gold, alpha=0.25, transform=ax.transAxes)
+
+    ax.text(0.5, 0.90, "XAU GUARDIAN", ha="center", fontsize=26, fontweight="bold", color=gold, transform=ax.transAxes)
+    ax.text(0.5, 0.84, "Bilan hebdomadaire", ha="center", fontsize=16, color=white, transform=ax.transAxes)
+    ax.text(0.5, 0.79, week_id, ha="center", fontsize=12, color=grey, transform=ax.transAxes)
+
+    pips_color = green if total_pips >= 0 else red
+    sign = "+" if total_pips >= 0 else ""
+    ax.text(0.5, 0.62, f"{sign}{total_pips} pips", ha="center", fontsize=52, fontweight="bold", color=pips_color, transform=ax.transAxes)
+    ax.text(0.5, 0.53, "si toutes les alertes avaient été suivies", ha="center", fontsize=11, color=grey, transform=ax.transAxes)
+
+    stats_y = 0.40
+    ax.text(0.5, stats_y, f"{n_total} signaux touchés cette semaine", ha="center", fontsize=13, color=white, transform=ax.transAxes)
+
+    # Ligne de stats avec petits marqueurs colorés au lieu d'emojis
+    ax.scatter([0.30], [stats_y - 0.06], color=green, s=60, transform=ax.transAxes, zorder=5)
+    ax.text(0.33, stats_y - 0.062, f"TP1 : {n_tp1}", ha="left", fontsize=13, color=white, transform=ax.transAxes)
+    ax.scatter([0.50], [stats_y - 0.06], color=green, s=60, transform=ax.transAxes, zorder=5)
+    ax.text(0.53, stats_y - 0.062, f"TP2 : {n_tp2}", ha="left", fontsize=13, color=white, transform=ax.transAxes)
+    ax.scatter([0.68], [stats_y - 0.06], color=red, s=60, transform=ax.transAxes, zorder=5)
+    ax.text(0.71, stats_y - 0.062, f"SL : {n_sl}", ha="left", fontsize=13, color=white, transform=ax.transAxes)
+
+    ax.text(0.5, stats_y - 0.12, f"Taux de réussite : {win_rate:.0f}%", ha="center", fontsize=13, color=white, transform=ax.transAxes)
+
+    ax.plot([0.15, 0.85], [0.16, 0.16], color=gold, linewidth=1, transform=ax.transAxes)
+    ax.text(0.5, 0.09, "Signaux automatisés, informatifs uniquement.", ha="center", fontsize=9, color=grey, transform=ax.transAxes)
+    ax.text(0.5, 0.05, "Pas un conseil financier personnalisé.", ha="center", fontsize=9, color=grey, transform=ax.transAxes)
+
+    fig.savefig(SUMMARY_IMAGE_PATH, facecolor=bg, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return SUMMARY_IMAGE_PATH
+
+
+def check_and_send_weekly_summary(state: dict) -> bool:
+    """Si on est en fin de semaine (clôture du marché) et que le bilan n'a pas
+    encore été envoyé cette semaine, génère et envoie l'image. Renvoie True si envoyé."""
+    now = datetime.now(timezone.utc)
+    is_closing_time = now.weekday() == WEEKLY_SUMMARY_WEEKDAY and now.hour >= WEEKLY_SUMMARY_HOUR_UTC
+    if not is_closing_time:
+        return False
+
+    week_id = get_week_id(now)
+    if state.get("last_summary_week") == week_id:
+        return False  # déjà envoyé cette semaine
+
+    trades = state.get("weekly_trades", [])
+    log(f"Clôture hebdomadaire détectée ({week_id}) — génération du bilan ({len(trades)} événements).")
+
+    image_path = generate_summary_image(week_id, trades)
+    total_pips = sum(p for _, p in trades)
+    sign = "+" if total_pips >= 0 else ""
+    caption = f"📊 <b>Bilan de la semaine {week_id}</b>\nRésultat cumulé : {sign}{total_pips} pips"
+    sent = send_photo(image_path, caption)
+    log(f"Bilan hebdomadaire envoyé : {sent}")
+
+    state["last_summary_week"] = week_id
+    state["weekly_trades"] = []  # on repart à zéro pour la semaine suivante
+    return True
 
 
 def run_once():
@@ -268,7 +397,17 @@ def run_once():
     last_rsi_zone = state.get("last_rsi_zone")
     last_candle_time = state.get("last_candle_time")
     open_trade = state.get("open_trade")
-    log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, last_candle_time={last_candle_time}, position ouverte={'oui' if open_trade and not open_trade.get('closed') else 'non'}")
+    weekly_trades = state.get("weekly_trades", [])
+    log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, "
+        f"position ouverte={'oui' if open_trade and not open_trade.get('closed') else 'non'}, "
+        f"événements cette semaine={len(weekly_trades)}")
+
+    # --- Vérification du bilan hebdomadaire (indépendant des données de marché) ---
+    summary_sent = check_and_send_weekly_summary(state)
+    if summary_sent:
+        save_state(state)
+        log("=== Fin de la vérification (bilan hebdomadaire envoyé) ===")
+        return
 
     candles = fetch_candles()
     if candles is None or len(candles) < max(LONG_WINDOW, RSI_PERIOD + 1):
@@ -284,10 +423,12 @@ def run_once():
     current_price = closes[-1]
 
     # --- Vérification de la position ouverte (TP1/TP2/SL) ---
-    trade_messages, open_trade = check_open_trade(current_price, open_trade)
+    trade_messages, open_trade, trade_events = check_open_trade(current_price, open_trade)
     for msg in trade_messages:
         sent = send_alert(msg)
         log(f"Alerte position envoyée ({msg.splitlines()[0]}) : {sent}")
+    for label, pips in trade_events:
+        weekly_trades.append((label, pips))
 
     atr = average_true_range(candles, ATR_PERIOD)
     if atr is None:
@@ -297,6 +438,8 @@ def run_once():
             "last_rsi_zone": last_rsi_zone,
             "last_candle_time": current_candle_time,
             "open_trade": open_trade,
+            "weekly_trades": weekly_trades,
+            "last_summary_week": state.get("last_summary_week"),
         })
         return
 
@@ -307,6 +450,8 @@ def run_once():
             "last_rsi_zone": last_rsi_zone,
             "last_candle_time": current_candle_time,
             "open_trade": open_trade,
+            "weekly_trades": weekly_trades,
+            "last_summary_week": state.get("last_summary_week"),
         })
         return
 
@@ -378,7 +523,7 @@ def run_once():
             }
         last_rsi_zone = current_zone
 
-    if alerts_sent == 0:
+    if alerts_sent == 0 and not trade_messages:
         log("Aucun changement détecté, pas d'alerte envoyée.")
 
     save_state({
@@ -386,6 +531,8 @@ def run_once():
         "last_rsi_zone": last_rsi_zone,
         "last_candle_time": current_candle_time,
         "open_trade": open_trade,
+        "weekly_trades": weekly_trades,
+        "last_summary_week": state.get("last_summary_week"),
     })
     log("=== Fin de la vérification, état sauvegardé ===")
 
