@@ -68,6 +68,9 @@ PIP_SIZE = 0.1  # 1 pip = 0.1 sur XAU/USD
 WEEKLY_SUMMARY_WEEKDAY = 4   # 0=lundi ... 4=vendredi
 WEEKLY_SUMMARY_HOUR_UTC = 21  # heure UTC à partir de laquelle on considère le marché fermé
 
+# --- Configuration du point marché quotidien ---
+DAILY_BRIEFING_HOUR_UTC = 7  # ~9h à Paris (hors changement d'heure) — ajustable
+
 STATE_FILE = "state.json"
 SUMMARY_IMAGE_PATH = "weekly_summary.png"
 
@@ -82,6 +85,7 @@ def load_state():
         "last_summary_week": None,
         "consecutive_failures": 0,
         "admin_alerted_for_streak": False,
+        "last_daily_briefing_date": None,
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -421,6 +425,47 @@ def check_and_send_weekly_summary(state: dict) -> bool:
     return True
 
 
+def format_daily_briefing(current_price: float, short_sma: float, long_sma: float, rsi: float, atr: float) -> str:
+    """Message purement descriptif — état du marché, pas une recommandation d'achat/vente."""
+    trend = "haussière 🟢" if short_sma > long_sma else "baissière 🔴"
+    if rsi >= RSI_OVERBOUGHT:
+        rsi_zone_label = "surachat"
+    elif rsi <= RSI_OVERSOLD:
+        rsi_zone_label = "survente"
+    else:
+        rsi_zone_label = "neutre"
+    date_str = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+
+    return (
+        f"📅 <b>Point marché — {SYMBOL}</b>\n"
+        f"{date_str}\n\n"
+        f"💰 Prix actuel : {current_price:.2f}\n"
+        f"📊 Tendance (SMA{SHORT_WINDOW}/{LONG_WINDOW}) : {trend}\n"
+        f"📈 RSI{RSI_PERIOD} : {rsi:.1f} (zone {rsi_zone_label})\n"
+        f"〰️ Volatilité (ATR) : {atr:.2f}\n\n"
+        f"<i>Information descriptive, pas une recommandation. Une alerte sera envoyée dès qu'un signal se déclenche.</i>"
+    )
+
+
+def check_and_send_daily_briefing(state: dict, current_price: float, short_sma: float, long_sma: float, rsi: float, atr: float) -> bool:
+    """Envoie le point marché quotidien une seule fois par jour ouvré, à l'heure configurée."""
+    now = datetime.now(timezone.utc)
+    is_weekday = now.weekday() <= 4  # lundi à vendredi
+    is_briefing_time = now.hour >= DAILY_BRIEFING_HOUR_UTC
+    if not (is_weekday and is_briefing_time):
+        return False
+
+    today_str = now.strftime("%Y-%m-%d")
+    if state.get("last_daily_briefing_date") == today_str:
+        return False  # déjà envoyé aujourd'hui
+
+    message = format_daily_briefing(current_price, short_sma, long_sma, rsi, atr)
+    sent = send_alert(message)
+    log(f"Point marché quotidien envoyé : {sent}")
+    state["last_daily_briefing_date"] = today_str
+    return sent
+
+
 def run_once():
     log("=== Démarrage de la vérification ===")
 
@@ -505,6 +550,13 @@ def run_once():
             "weekly_trades": weekly_trades,
         })
         return
+
+    # --- Point marché quotidien (indépendant du filtre de volatilité) ---
+    briefing_short_sma = simple_moving_average(closes, SHORT_WINDOW)
+    briefing_long_sma = simple_moving_average(closes, LONG_WINDOW)
+    briefing_rsi = relative_strength_index(closes, RSI_PERIOD)
+    if briefing_short_sma is not None and briefing_long_sma is not None and briefing_rsi is not None:
+        check_and_send_daily_briefing(state, current_price, briefing_short_sma, briefing_long_sma, briefing_rsi, atr)
 
     if atr < ATR_MIN_THRESHOLD:
         log(f"ATR trop faible ({atr:.3f} < {ATR_MIN_THRESHOLD}) — marché quasi plat, signaux ignorés pour éviter le bruit.")
@@ -610,4 +662,3 @@ if __name__ == "__main__":
         log("=== ERREUR INATTENDUE ===")
         log(traceback.format_exc())
         sys.exit(1)
-        
