@@ -309,7 +309,15 @@ def already_in_direction(open_trade, action: str) -> bool:
     return open_trade is not None and not open_trade.get("closed") and open_trade.get("action") == action
 
 
-def close_previous_trade_if_open(open_trade, current_price: float, weekly_trades: list):
+def event_date(candle_datetime: str) -> str:
+    """Extrait la date (JJ/MM) d'un horodatage de bougie, pour regrouper le
+    bilan par jour dans l'image récapitulative."""
+    date_part = candle_datetime.split(" ")[0]  # "YYYY-MM-DD"
+    year, month, day = date_part.split("-")
+    return f"{day}/{month}"
+
+
+def close_previous_trade_if_open(open_trade, current_price: float, weekly_trades: list, current_candle_time: str):
     """Si une position est encore ouverte (ni TP2 ni SL touché), la clôture au
     prix courant AVANT qu'un nouveau signal ne l'écrase dans l'état. Sans ça,
     un trade en cours disparaît silencieusement : plus aucun message de suivi
@@ -320,7 +328,12 @@ def close_previous_trade_if_open(open_trade, current_price: float, weekly_trades
         return None
     message = format_manual_close(open_trade["action"], open_trade["entry"], current_price)
     pips = signed_pips(open_trade["action"], open_trade["entry"], current_price)
-    weekly_trades.append(("FLIP", pips))
+    weekly_trades.append({
+        "label": "FLIP",
+        "pips": pips,
+        "date": event_date(current_candle_time),
+        "action": open_trade["action"],
+    })
     open_trade["closed"] = True
     return message
 
@@ -331,7 +344,10 @@ def check_open_trade(candles: list, open_trade: dict):
     en examinant le plus haut/plus bas de CHAQUE bougie récupérée (pas
     seulement le dernier prix de clôture) — ça évite de rater un niveau
     touché brièvement entre deux vérifications du bot.
-    Renvoie (messages_a_envoyer, open_trade_mis_a_jour, evenements_pips).
+    Renvoie (messages_a_envoyer, open_trade_mis_a_jour, evenements).
+    Chaque événement est un dict {label, pips, date, action} — la date et la
+    direction (BUY/SELL) permettent de regrouper le bilan par jour et
+    d'afficher "ACHAT OR"/"VENTE OR" dans l'image récapitulative.
     """
     if open_trade is None or open_trade.get("closed"):
         return [], open_trade, []
@@ -351,35 +367,36 @@ def check_open_trade(candles: list, open_trade: dict):
         if open_trade.get("closed"):
             break
         high, low = candle["high"], candle["low"]
+        candle_date = event_date(candle["datetime"])
 
         if action == "BUY":
             # SL prioritaire si le SL et un TP sont touchés dans la même bougie (prudence)
             if not open_trade.get("closed") and low <= sl:
                 messages.append(format_sl_hit(entry, sl))
-                events.append(("SL", -pips_between(entry, sl)))
+                events.append({"label": "SL", "pips": -pips_between(entry, sl), "date": candle_date, "action": action})
                 open_trade["closed"] = True
                 continue
             if not open_trade.get("tp1_hit") and high >= tp1:
                 messages.append(format_tp_hit("TP1", entry, tp1))
-                events.append(("TP1", pips_between(entry, tp1)))
+                events.append({"label": "TP1", "pips": pips_between(entry, tp1), "date": candle_date, "action": action})
                 open_trade["tp1_hit"] = True
             if not open_trade.get("tp2_hit") and high >= tp2:
                 messages.append(format_tp_hit("TP2", entry, tp2))
-                events.append(("TP2", pips_between(entry, tp2)))
+                events.append({"label": "TP2", "pips": pips_between(entry, tp2), "date": candle_date, "action": action})
                 open_trade["tp2_hit"] = True
         else:  # SELL
             if not open_trade.get("closed") and high >= sl:
                 messages.append(format_sl_hit(entry, sl))
-                events.append(("SL", -pips_between(entry, sl)))
+                events.append({"label": "SL", "pips": -pips_between(entry, sl), "date": candle_date, "action": action})
                 open_trade["closed"] = True
                 continue
             if not open_trade.get("tp1_hit") and low <= tp1:
                 messages.append(format_tp_hit("TP1", entry, tp1))
-                events.append(("TP1", pips_between(entry, tp1)))
+                events.append({"label": "TP1", "pips": pips_between(entry, tp1), "date": candle_date, "action": action})
                 open_trade["tp1_hit"] = True
             if not open_trade.get("tp2_hit") and low <= tp2:
                 messages.append(format_tp_hit("TP2", entry, tp2))
-                events.append(("TP2", pips_between(entry, tp2)))
+                events.append({"label": "TP2", "pips": pips_between(entry, tp2), "date": candle_date, "action": action})
                 open_trade["tp2_hit"] = True
 
     return messages, open_trade, events
@@ -392,67 +409,123 @@ def get_week_id(dt: datetime) -> str:
 
 
 def generate_summary_image(week_id: str, trades: list) -> str:
-    """Génère l'image de bilan hebdomadaire avec Matplotlib et renvoie son chemin."""
-    total_pips = sum(p for _, p in trades)
-    n_tp1 = sum(1 for label, _ in trades if label == "TP1")
-    n_tp2 = sum(1 for label, _ in trades if label == "TP2")
-    n_sl = sum(1 for label, _ in trades if label == "SL")
-    n_flip_win = sum(1 for label, pips in trades if label == "FLIP" and pips >= 0)
-    n_flip_loss = sum(1 for label, pips in trades if label == "FLIP" and pips < 0)
-    n_flips = n_flip_win + n_flip_loss
-    n_wins = n_tp1 + n_tp2 + n_flip_win
-    n_total = len(trades)
+    """Génère l'image de bilan hebdomadaire avec Matplotlib et renvoie son chemin.
+    Regroupe les événements réellement enregistrés par le bot, jour par jour
+    (ACHAT OR / VENTE OR, résultat en pips, coche verte ou croix rouge), avec
+    un sous-bilan par jour puis les totaux de la semaine en bas. Uniquement
+    des chiffres réels — rien n'est saisi à la main."""
+    # Compat avec d'anciennes entrées (label, pips) sans date/direction.
+    normalized = []
+    for t in trades:
+        if isinstance(t, dict):
+            normalized.append(t)
+        else:
+            label, pips = t[0], t[1]
+            normalized.append({"label": label, "pips": pips, "date": "?", "action": "?"})
+
+    total_pips = sum(t["pips"] for t in normalized)
+    n_flip_win = sum(1 for t in normalized if t["label"] == "FLIP" and t["pips"] >= 0)
+    n_wins = sum(1 for t in normalized if t["pips"] >= 0)
+    n_total = len(normalized)
     win_rate = (n_wins / n_total * 100) if n_total else 0
 
+    # Regroupement par jour, dans l'ordre d'apparition.
+    days = []
+    by_day = {}
+    for t in normalized:
+        d = t["date"]
+        if d not in by_day:
+            by_day[d] = []
+            days.append(d)
+        by_day[d].append(t)
+
     bg = "#0d0f16"
+    box_bg = "#171a24"
     gold = "#c6a34e"
     green = "#2ecc71"
     red = "#e74c3c"
     white = "#e8ecf2"
     grey = "#8a93a3"
 
-    fig, ax = plt.subplots(figsize=(8, 8), facecolor=bg)
+    # --- Hauteur calculée dynamiquement pour que rien ne se chevauche,
+    # quel que soit le nombre de jours / trades de la semaine.
+    LINE_H = 0.34
+    DAY_BILAN_H = 0.42
+    DAY_GAP = 0.22
+    HEADER_H = 2.35
+    FOOTER_H = 2.0
+    body_h = sum(len(by_day[d]) * LINE_H + DAY_BILAN_H + DAY_GAP for d in days) if days else 0.7
+    total_h = HEADER_H + body_h + FOOTER_H
+    width = 8.0
+
+    fig, ax = plt.subplots(figsize=(width, total_h), facecolor=bg)
     ax.set_facecolor(bg)
     ax.axis("off")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    ax.set_xlim(0, width)
+    ax.set_ylim(0, total_h)
 
-    # Petit badge triangulaire doré au-dessus du titre
-    ax.plot([0.485, 0.515, 0.455, 0.485], [0.985, 0.945, 0.945, 0.985], color=gold, linewidth=2, transform=ax.transAxes)
-    ax.fill([0.485, 0.515, 0.455], [0.985, 0.945, 0.945], color=gold, alpha=0.25, transform=ax.transAxes)
+    def y_at(offset_from_top):
+        return total_h - offset_from_top
 
-    ax.text(0.5, 0.90, "XAU GUARDIAN", ha="center", fontsize=26, fontweight="bold", color=gold, transform=ax.transAxes)
-    ax.text(0.5, 0.84, "Bilan hebdomadaire", ha="center", fontsize=16, color=white, transform=ax.transAxes)
-    ax.text(0.5, 0.79, week_id, ha="center", fontsize=12, color=grey, transform=ax.transAxes)
+    # --- En-tête ---
+    cursor = 0.55
+    ax.plot(
+        [width / 2 - 0.13, width / 2 + 0.13, width / 2 - 0.13, width / 2],
+        [y_at(cursor) + 0.16, y_at(cursor), y_at(cursor), y_at(cursor) + 0.16],
+        color=gold, linewidth=1.6,
+    )
+    cursor += 0.55
+    ax.text(width / 2, y_at(cursor), "XAU GUARDIAN", ha="center", fontsize=25, fontweight="bold", color=gold)
+    cursor += 0.42
+    ax.text(width / 2, y_at(cursor), "BILAN DE LA SEMAINE", ha="center", fontsize=15, fontweight="bold", color=white)
+    cursor += 0.32
+    ax.text(width / 2, y_at(cursor), week_id, ha="center", fontsize=10.5, color=grey)
+    cursor += 0.4
 
+    # --- Corps : un bloc par jour ---
+    box_left, box_right = 0.35, width - 0.35
+    if not days:
+        ax.text(width / 2, y_at(cursor + 0.35), "Aucune position clôturée cette semaine.", ha="center", fontsize=12, color=grey)
+        cursor += 0.7
+    for d in days:
+        day_trades = by_day[d]
+        box_h = len(day_trades) * LINE_H + DAY_BILAN_H + 0.12
+        ax.add_patch(plt.Rectangle((box_left, y_at(cursor + box_h)), box_right - box_left, box_h,
+                                    facecolor=box_bg, edgecolor="none", zorder=1))
+        cursor += 0.24
+        for t in day_trades:
+            action_label = "ACHAT OR" if t["action"] == "BUY" else ("VENTE OR" if t["action"] == "SELL" else "POSITION")
+            win = t["pips"] >= 0
+            sign = "+" if win else ""
+            mark_color = green if win else red
+            mark = "✓" if win else "✗"
+            ax.text(box_left + 0.18, y_at(cursor), f"{d}  {action_label}", ha="left", va="center", fontsize=11.5, color=white, zorder=2)
+            ax.text(box_right - 0.85, y_at(cursor), f"{sign}{t['pips']}PIPS", ha="right", va="center", fontsize=11.5, fontweight="bold", color=mark_color, zorder=2)
+            ax.text(box_right - 0.20, y_at(cursor), mark, ha="center", va="center", fontsize=13, fontweight="bold", color=mark_color, zorder=2)
+            cursor += LINE_H
+        day_wins = sum(1 for t in day_trades if t["pips"] >= 0)
+        cursor += DAY_BILAN_H * 0.75
+        ax.text(width / 2, y_at(cursor), f"BILAN : {day_wins}/{len(day_trades)}", ha="center", fontsize=13.5, fontweight="bold", color=gold, zorder=2)
+        cursor += DAY_BILAN_H * 0.25 + DAY_GAP
+
+    # --- Totaux de la semaine ---
     pips_color = green if total_pips >= 0 else red
     sign = "+" if total_pips >= 0 else ""
-    ax.text(0.5, 0.62, f"{sign}{total_pips} pips", ha="center", fontsize=52, fontweight="bold", color=pips_color, transform=ax.transAxes)
-    ax.text(0.5, 0.53, "si toutes les alertes avaient été suivies", ha="center", fontsize=11, color=grey, transform=ax.transAxes)
-
-    stats_y = 0.40
-    ax.text(0.5, stats_y, f"{n_total} signaux touchés cette semaine", ha="center", fontsize=13, color=white, transform=ax.transAxes)
-
-    # Ligne de stats avec petits marqueurs colorés au lieu d'emojis
-    ax.scatter([0.30], [stats_y - 0.06], color=green, s=60, transform=ax.transAxes, zorder=5)
-    ax.text(0.33, stats_y - 0.062, f"TP1 : {n_tp1}", ha="left", fontsize=13, color=white, transform=ax.transAxes)
-    ax.scatter([0.50], [stats_y - 0.06], color=green, s=60, transform=ax.transAxes, zorder=5)
-    ax.text(0.53, stats_y - 0.062, f"TP2 : {n_tp2}", ha="left", fontsize=13, color=white, transform=ax.transAxes)
-    ax.scatter([0.68], [stats_y - 0.06], color=red, s=60, transform=ax.transAxes, zorder=5)
-    ax.text(0.71, stats_y - 0.062, f"SL : {n_sl}", ha="left", fontsize=13, color=white, transform=ax.transAxes)
-
-    ax.text(0.5, stats_y - 0.12, f"Taux de réussite : {win_rate:.0f}%", ha="center", fontsize=13, color=white, transform=ax.transAxes)
-
-    if n_flips:
-        ax.text(
-            0.5, stats_y - 0.19,
-            f"Clôtures anticipées (nouveau signal) : {n_flips} (dont {n_flip_win} gagnantes)",
-            ha="center", fontsize=10, color=grey, transform=ax.transAxes,
-        )
-
-    ax.plot([0.15, 0.85], [0.16, 0.16], color=gold, linewidth=1, transform=ax.transAxes)
-    ax.text(0.5, 0.09, "Signaux automatisés, informatifs uniquement.", ha="center", fontsize=9, color=grey, transform=ax.transAxes)
-    ax.text(0.5, 0.05, "Pas un conseil financier personnalisé.", ha="center", fontsize=9, color=grey, transform=ax.transAxes)
+    if n_total:
+        ax.plot([width * 0.2, width * 0.8], [y_at(cursor), y_at(cursor)], color=gold, linewidth=1)
+        cursor += 0.55
+        ax.text(width / 2, y_at(cursor), f"BILAN TRADES : {n_wins}/{n_total}", ha="center", fontsize=14, fontweight="bold", color=white)
+        cursor += 0.45
+        ax.text(width / 2, y_at(cursor), f"BILAN PIPS : {sign}{total_pips}", ha="center", fontsize=14, fontweight="bold", color=pips_color)
+        cursor += 0.45
+        ax.text(width / 2, y_at(cursor), f"{win_rate:.0f}% DE RÉUSSITE", ha="center", fontsize=14, fontweight="bold", color=gold)
+        cursor += 0.5
+    else:
+        cursor += 0.3
+    ax.text(width / 2, y_at(cursor), "Résultats réels du bot, calculés automatiquement — informatif uniquement,",
+            ha="center", fontsize=8.3, color=grey)
+    cursor += 0.24
+    ax.text(width / 2, y_at(cursor), "pas un conseil financier personnalisé.", ha="center", fontsize=8.3, color=grey)
 
     fig.savefig(SUMMARY_IMAGE_PATH, facecolor=bg, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -603,9 +676,9 @@ def run_once():
     for msg in trade_messages:
         sent = send_alert(msg)
         log(f"Alerte position envoyée ({msg.splitlines()[0]}) : {sent}")
-    for label, pips in trade_events:
-        weekly_trades.append((label, pips))
-        if label == "SL":
+    for event in trade_events:
+        weekly_trades.append(event)
+        if event["label"] == "SL":
             cooldown_candles_remaining = SL_COOLDOWN_CANDLES
             log(f"SL touché — cooldown de {SL_COOLDOWN_CANDLES} bougies activé avant le prochain signal.")
 
@@ -688,7 +761,7 @@ def run_once():
                 # RSI), on la clôture au prix courant avant d'en ouvrir une
                 # nouvelle — sinon elle disparaîtrait silencieusement de
                 # l'état et du bilan.
-                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
                     log(f"Position précédente clôturée avant nouveau signal SMA : {sent_close}")
@@ -735,7 +808,7 @@ def run_once():
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "BUY")
             if trend_ok and cooldown_ok and not_duplicate:
-                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
                     log(f"Position précédente clôturée avant nouveau signal RSI (BUY) : {sent_close}")
@@ -765,7 +838,7 @@ def run_once():
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "SELL")
             if trend_ok and cooldown_ok and not_duplicate:
-                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
                     log(f"Position précédente clôturée avant nouveau signal RSI (SELL) : {sent_close}")
