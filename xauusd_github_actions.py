@@ -73,6 +73,15 @@ SL_COOLDOWN_CANDLES = 3         # nb de bougies (5 min) à attendre après un SL
 # --- Configuration du suivi de position (pips) ---
 PIP_SIZE = 0.1  # 1 pip = 0.1 sur XAU/USD
 
+# --- Conversion pips -> euros pour le bilan (estimation) ---
+# Base : spécification de contrat standard XAU/USD (100 oz par lot de 1.00),
+# la plus répandue chez les brokers. À 0.01 lot, 1 pip du bot (0,10$ de
+# mouvement) vaut 100 oz x 0.01 x 0,10$ = 0,10$/pip, assimilé ici à 0,10€/pip.
+# C'est une ESTIMATION : elle ne tient pas compte du spread, des commissions,
+# ni du taux de change USD/EUR réel — le contrat exact peut varier selon ton
+# broker (à vérifier dans ses spécifications XAUUSD si besoin de précision).
+PIP_VALUE_EUR_PER_001_LOT = 0.10
+
 # --- Configuration du bilan hebdomadaire ---
 WEEKLY_SUMMARY_WEEKDAY = 4   # 0=lundi ... 4=vendredi
 WEEKLY_SUMMARY_HOUR_UTC = 21  # heure UTC à partir de laquelle on considère le marché fermé
@@ -453,7 +462,7 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     DAY_BILAN_H = 0.42
     DAY_GAP = 0.22
     HEADER_H = 2.35
-    FOOTER_H = 2.0
+    FOOTER_H = 2.5
     body_h = sum(len(by_day[d]) * LINE_H + DAY_BILAN_H + DAY_GAP for d in days) if days else 0.7
     total_h = HEADER_H + body_h + FOOTER_H
     width = 8.0
@@ -511,15 +520,20 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     # --- Totaux de la semaine ---
     pips_color = green if total_pips >= 0 else red
     sign = "+" if total_pips >= 0 else ""
+    total_eur = total_pips * PIP_VALUE_EUR_PER_001_LOT
     if n_total:
         ax.plot([width * 0.2, width * 0.8], [y_at(cursor), y_at(cursor)], color=gold, linewidth=1)
         cursor += 0.55
         ax.text(width / 2, y_at(cursor), f"BILAN TRADES : {n_wins}/{n_total}", ha="center", fontsize=14, fontweight="bold", color=white)
         cursor += 0.45
-        ax.text(width / 2, y_at(cursor), f"BILAN PIPS : {sign}{total_pips}", ha="center", fontsize=14, fontweight="bold", color=pips_color)
+        ax.text(width / 2, y_at(cursor), f"BILAN PIPS : {sign}{total_pips} pips (~{sign}{total_eur:.0f}€ en 0.01 lot)",
+                ha="center", fontsize=13.5, fontweight="bold", color=pips_color)
         cursor += 0.45
         ax.text(width / 2, y_at(cursor), f"{win_rate:.0f}% DE RÉUSSITE", ha="center", fontsize=14, fontweight="bold", color=gold)
-        cursor += 0.5
+        cursor += 0.35
+        ax.text(width / 2, y_at(cursor), "Conversion en euros estimée (spéc. contrat standard, hors spread/commissions)",
+                ha="center", fontsize=8, color=grey)
+        cursor += 0.35
     else:
         cursor += 0.3
     ax.text(width / 2, y_at(cursor), "Résultats réels du bot, calculés automatiquement — informatif uniquement,",
@@ -548,9 +562,13 @@ def check_and_send_weekly_summary(state: dict) -> bool:
     log(f"Clôture hebdomadaire détectée ({week_id}) — génération du bilan ({len(trades)} événements).")
 
     image_path = generate_summary_image(week_id, trades)
-    total_pips = sum(p for _, p in trades)
+    total_pips = sum((t["pips"] if isinstance(t, dict) else t[1]) for t in trades)
+    total_eur = total_pips * PIP_VALUE_EUR_PER_001_LOT
     sign = "+" if total_pips >= 0 else ""
-    caption = f"📊 <b>Bilan de la semaine {week_id}</b>\nRésultat cumulé : {sign}{total_pips} pips"
+    caption = (
+        f"📊 <b>Bilan de la semaine {week_id}</b>\n"
+        f"Résultat cumulé : {sign}{total_pips} pips (~{sign}{total_eur:.0f}€ en 0.01 lot)"
+    )
     sent = send_photo(image_path, caption)
     log(f"Bilan hebdomadaire envoyé : {sent}")
 
