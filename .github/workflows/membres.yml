@@ -1,0 +1,56 @@
+name: Membres XAU Guardian
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xauusd-membres
+  cancel-in-progress: false
+
+jobs:
+  handle-members:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install requests
+
+      - name: Répondre aux membres et accueillir les nouveaux
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          AVATRADE_LINK: ${{ secrets.AVATRADE_LINK }}
+          BOT_USERNAME: TradePulse38Bot
+        run: python -u telegram_membre_bot.py
+
+      - name: Sauvegarder l'état (bot_state.json) dans le dépôt
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bot_state.json
+          git diff --quiet --cached || git commit -m "Mise a jour de l'etat des membres"
+
+          for i in 1 2 3 4 5; do
+            if git push; then
+              echo "Push réussi (tentative $i)."
+              break
+            fi
+            echo "Push rejeté (tentative $i/5), récupération des derniers changements..."
+            git pull --rebase --autostash
+            sleep $((RANDOM % 5 + 1))
+          done
