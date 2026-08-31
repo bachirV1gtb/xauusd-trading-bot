@@ -264,6 +264,13 @@ def pips_between(price_a: float, price_b: float) -> int:
     return round(abs(price_a - price_b) / PIP_SIZE)
 
 
+def signed_pips(action: str, entry: float, exit_price: float) -> int:
+    """Écart en pips entre l'entrée et un prix de sortie, signé : positif si
+    le trade est gagnant pour la direction prise (BUY ou SELL), négatif sinon."""
+    diff = (exit_price - entry) if action == "BUY" else (entry - exit_price)
+    return round(diff / PIP_SIZE)
+
+
 def format_tp_hit(level_name: str, entry: float, level_price: float) -> str:
     pips = pips_between(entry, level_price)
     return f"🎯 {level_name} TOUCHÉ 🔥\n{SYMBOL} +{pips} pips ✅"
@@ -272,6 +279,32 @@ def format_tp_hit(level_name: str, entry: float, level_price: float) -> str:
 def format_sl_hit(entry: float, sl_price: float) -> str:
     pips = pips_between(entry, sl_price)
     return f"🔒 SL TOUCHÉ ❌\n{SYMBOL} -{pips} pips"
+
+
+def format_manual_close(action: str, entry: float, exit_price: float) -> str:
+    """Message envoyé quand une position encore ouverte est clôturée au prix
+    courant parce qu'un nouveau signal (SMA ou RSI) vient d'arriver, pour ne
+    jamais perdre le suivi d'un trade en cours ni fausser le bilan."""
+    pips = signed_pips(action, entry, exit_price)
+    sign = "+" if pips >= 0 else ""
+    emoji = "✅" if pips >= 0 else "❌"
+    return f"🔄 POSITION CLÔTURÉE (nouveau signal) {emoji}\n{SYMBOL} {sign}{pips} pips"
+
+
+def close_previous_trade_if_open(open_trade, current_price: float, weekly_trades: list):
+    """Si une position est encore ouverte (ni TP2 ni SL touché), la clôture au
+    prix courant AVANT qu'un nouveau signal ne l'écrase dans l'état. Sans ça,
+    un trade en cours disparaît silencieusement : plus aucun message de suivi
+    n'est envoyé au canal, et il n'est jamais compté dans le bilan hebdomadaire
+    (ni gagnant, ni perdant), ce qui fausse le taux de réussite affiché.
+    Renvoie le message à envoyer, ou None s'il n'y avait rien à clôturer."""
+    if open_trade is None or open_trade.get("closed"):
+        return None
+    message = format_manual_close(open_trade["action"], open_trade["entry"], current_price)
+    pips = signed_pips(open_trade["action"], open_trade["entry"], current_price)
+    weekly_trades.append(("FLIP", pips))
+    open_trade["closed"] = True
+    return message
 
 
 def check_open_trade(candles: list, open_trade: dict):
@@ -346,7 +379,10 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     n_tp1 = sum(1 for label, _ in trades if label == "TP1")
     n_tp2 = sum(1 for label, _ in trades if label == "TP2")
     n_sl = sum(1 for label, _ in trades if label == "SL")
-    n_wins = n_tp1 + n_tp2
+    n_flip_win = sum(1 for label, pips in trades if label == "FLIP" and pips >= 0)
+    n_flip_loss = sum(1 for label, pips in trades if label == "FLIP" and pips < 0)
+    n_flips = n_flip_win + n_flip_loss
+    n_wins = n_tp1 + n_tp2 + n_flip_win
     n_total = len(trades)
     win_rate = (n_wins / n_total * 100) if n_total else 0
 
@@ -388,6 +424,13 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     ax.text(0.71, stats_y - 0.062, f"SL : {n_sl}", ha="left", fontsize=13, color=white, transform=ax.transAxes)
 
     ax.text(0.5, stats_y - 0.12, f"Taux de réussite : {win_rate:.0f}%", ha="center", fontsize=13, color=white, transform=ax.transAxes)
+
+    if n_flips:
+        ax.text(
+            0.5, stats_y - 0.19,
+            f"Clôtures anticipées (nouveau signal) : {n_flips} (dont {n_flip_win} gagnantes)",
+            ha="center", fontsize=10, color=grey, transform=ax.transAxes,
+        )
 
     ax.plot([0.15, 0.85], [0.16, 0.16], color=gold, linewidth=1, transform=ax.transAxes)
     ax.text(0.5, 0.09, "Signaux automatisés, informatifs uniquement.", ha="center", fontsize=9, color=grey, transform=ax.transAxes)
@@ -579,6 +622,14 @@ def run_once():
         current_sma_signal = "BUY" if short_sma > long_sma else "SELL"
         log(f"SMA : signal actuel={current_sma_signal} (précédent={last_sma_signal}) — SMA{SHORT_WINDOW}={short_sma:.2f} / SMA{LONG_WINDOW}={long_sma:.2f}")
         if last_sma_signal is not None and current_sma_signal != last_sma_signal:
+            # Si une position est encore ouverte (précédent signal SMA ou RSI),
+            # on la clôture au prix courant avant d'en ouvrir une nouvelle —
+            # sinon elle disparaîtrait silencieusement de l'état et du bilan.
+            close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+            if close_message:
+                sent_close = send_alert(close_message)
+                log(f"Position précédente clôturée avant nouveau signal SMA : {sent_close}")
+
             tp1, tp2, stop_loss = compute_tp_sl(current_sma_signal, current_price, atr)
             note = f"Signal : croisement SMA{SHORT_WINDOW}/SMA{LONG_WINDOW} (SMA{SHORT_WINDOW}={short_sma:.2f} / SMA{LONG_WINDOW}={long_sma:.2f})"
             message = format_alert(current_sma_signal, current_price, tp1, tp2, stop_loss, note)
@@ -604,6 +655,11 @@ def run_once():
         current_zone = rsi_zone(rsi)
         log(f"RSI : {rsi:.1f} — zone actuelle={current_zone} (précédente={last_rsi_zone})")
         if last_rsi_zone == "oversold" and current_zone == "neutral":
+            close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+            if close_message:
+                sent_close = send_alert(close_message)
+                log(f"Position précédente clôturée avant nouveau signal RSI (BUY) : {sent_close}")
+
             tp1, tp2, stop_loss = compute_tp_sl("BUY", current_price, atr)
             note = f"Signal : RSI sort de survente (RSI={rsi:.1f})"
             message = format_alert("BUY", current_price, tp1, tp2, stop_loss, note)
@@ -622,6 +678,11 @@ def run_once():
                 "entry_time": current_candle_time,
             }
         elif last_rsi_zone == "overbought" and current_zone == "neutral":
+            close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+            if close_message:
+                sent_close = send_alert(close_message)
+                log(f"Position précédente clôturée avant nouveau signal RSI (SELL) : {sent_close}")
+
             tp1, tp2, stop_loss = compute_tp_sl("SELL", current_price, atr)
             note = f"Signal : RSI sort de surachat (RSI={rsi:.1f})"
             message = format_alert("SELL", current_price, tp1, tp2, stop_loss, note)
