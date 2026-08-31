@@ -59,7 +59,16 @@ ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 ATR_TP1_MULTIPLIER = 1.0
 ATR_TP2_MULTIPLIER = 2.5
-ATR_MIN_THRESHOLD = 0.5  # en dessous de ça (marché quasi plat), on ignore les signaux
+ATR_MIN_THRESHOLD = 0.5  # plancher absolu de sécurité (marché quasiment mort)
+
+# --- Configuration du filtre de qualité des signaux ---
+# Objectif : moins de signaux, mais plus fiables. Trois garde-fous s'ajoutent
+# au croisement SMA et à la sortie de zone RSI bruts :
+TREND_WINDOW = 50               # SMA "de fond" utilisée comme filtre de tendance générale
+ATR_BASELINE_PERIOD = 50        # période de référence pour juger si la volatilité actuelle est normale
+ATR_RELATIVE_MIN_RATIO = 0.6    # l'ATR courant doit valoir au moins 60% de sa moyenne récente
+MIN_CROSSOVER_ATR_RATIO = 0.15  # écart minimum SMA courte/longue au croisement (fraction de l'ATR) pour ignorer les croisements "au ras des pâquerettes"
+SL_COOLDOWN_CANDLES = 3         # nb de bougies (5 min) à attendre après un SL avant d'accepter un nouveau signal
 
 # --- Configuration du suivi de position (pips) ---
 PIP_SIZE = 0.1  # 1 pip = 0.1 sur XAU/USD
@@ -86,6 +95,7 @@ def load_state():
         "consecutive_failures": 0,
         "admin_alerted_for_streak": False,
         "last_daily_briefing_date": None,
+        "cooldown_candles_remaining": 0,
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -169,7 +179,7 @@ def format_alert(action: str, price: float, tp1: float, tp2: float, stop_loss: f
 
 
 def fetch_candles():
-    outputsize = max(LONG_WINDOW, ATR_PERIOD, RSI_PERIOD) + 10
+    outputsize = max(LONG_WINDOW, ATR_PERIOD, RSI_PERIOD, TREND_WINDOW, ATR_BASELINE_PERIOD) + 20
     params = {
         "symbol": SYMBOL,
         "interval": INTERVAL,
@@ -289,6 +299,14 @@ def format_manual_close(action: str, entry: float, exit_price: float) -> str:
     sign = "+" if pips >= 0 else ""
     emoji = "✅" if pips >= 0 else "❌"
     return f"🔄 POSITION CLÔTURÉE (nouveau signal) {emoji}\n{SYMBOL} {sign}{pips} pips"
+
+
+def already_in_direction(open_trade, action: str) -> bool:
+    """Vrai si une position est déjà ouverte dans la même direction que le
+    nouveau signal — évite de clôturer puis rouvrir immédiatement la même
+    position (au même prix) si le SMA et le RSI signalent la même direction
+    au même run, ce qui ne ferait qu'envoyer une alerte redondante."""
+    return open_trade is not None and not open_trade.get("closed") and open_trade.get("action") == action
 
 
 def close_previous_trade_if_open(open_trade, current_price: float, weekly_trades: list):
@@ -524,9 +542,10 @@ def run_once():
     last_candle_time = state.get("last_candle_time")
     open_trade = state.get("open_trade")
     weekly_trades = state.get("weekly_trades", [])
+    cooldown_candles_remaining = state.get("cooldown_candles_remaining", 0)
     log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, "
         f"position ouverte={'oui' if open_trade and not open_trade.get('closed') else 'non'}, "
-        f"événements cette semaine={len(weekly_trades)}")
+        f"événements cette semaine={len(weekly_trades)}, cooldown restant={cooldown_candles_remaining}")
 
     # --- Vérification du bilan hebdomadaire (indépendant des données de marché) ---
     summary_sent = check_and_send_weekly_summary(state)
@@ -535,8 +554,9 @@ def run_once():
         log("=== Fin de la vérification (bilan hebdomadaire envoyé) ===")
         return
 
+    min_candles_required = max(LONG_WINDOW, RSI_PERIOD + 1, TREND_WINDOW, ATR_BASELINE_PERIOD + 1)
     candles = fetch_candles()
-    if candles is None or len(candles) < max(LONG_WINDOW, RSI_PERIOD + 1):
+    if candles is None or len(candles) < min_candles_required:
         log("Pas assez de données pour calculer les indicateurs, on arrête ici.")
         consecutive_failures = state.get("consecutive_failures", 0) + 1
         admin_alerted = state.get("admin_alerted_for_streak", False)
@@ -570,6 +590,11 @@ def run_once():
         log(f"Aucune nouvelle bougie depuis la dernière vérification (marché probablement fermé — {current_candle_time}). On arrête ici, pas de recalcul.")
         return
 
+    # Une nouvelle bougie est arrivée : le cooldown après un SL avance d'un cran.
+    if cooldown_candles_remaining > 0:
+        cooldown_candles_remaining -= 1
+        log(f"Cooldown après SL actif : encore {cooldown_candles_remaining} bougie(s) avant de reprendre de nouvelles entrées.")
+
     closes = [c["close"] for c in candles]
     current_price = closes[-1]
 
@@ -580,6 +605,9 @@ def run_once():
         log(f"Alerte position envoyée ({msg.splitlines()[0]}) : {sent}")
     for label, pips in trade_events:
         weekly_trades.append((label, pips))
+        if label == "SL":
+            cooldown_candles_remaining = SL_COOLDOWN_CANDLES
+            log(f"SL touché — cooldown de {SL_COOLDOWN_CANDLES} bougies activé avant le prochain signal.")
 
     atr = average_true_range(candles, ATR_PERIOD)
     if atr is None:
@@ -591,18 +619,30 @@ def run_once():
             "last_candle_time": current_candle_time,
             "open_trade": open_trade,
             "weekly_trades": weekly_trades,
+            "cooldown_candles_remaining": cooldown_candles_remaining,
         })
         return
 
-    # --- Point marché quotidien (indépendant du filtre de volatilité) ---
-    briefing_short_sma = simple_moving_average(closes, SHORT_WINDOW)
-    briefing_long_sma = simple_moving_average(closes, LONG_WINDOW)
-    briefing_rsi = relative_strength_index(closes, RSI_PERIOD)
-    if briefing_short_sma is not None and briefing_long_sma is not None and briefing_rsi is not None:
-        check_and_send_daily_briefing(state, current_price, briefing_short_sma, briefing_long_sma, briefing_rsi, atr)
+    # Indicateurs calculés une seule fois et réutilisés pour le point quotidien
+    # ET pour les deux signaux ci-dessous (plus de double calcul divergent).
+    short_sma = simple_moving_average(closes, SHORT_WINDOW)
+    long_sma = simple_moving_average(closes, LONG_WINDOW)
+    trend_sma = simple_moving_average(closes, TREND_WINDOW)  # tendance de fond, filtre de qualité
+    rsi = relative_strength_index(closes, RSI_PERIOD)
 
-    if atr < ATR_MIN_THRESHOLD:
-        log(f"ATR trop faible ({atr:.3f} < {ATR_MIN_THRESHOLD}) — marché quasi plat, signaux ignorés pour éviter le bruit.")
+    # --- Point marché quotidien (indépendant du filtre de volatilité) ---
+    if short_sma is not None and long_sma is not None and rsi is not None:
+        check_and_send_daily_briefing(state, current_price, short_sma, long_sma, rsi, atr)
+
+    # Filtre de volatilité ADAPTATIF : on compare l'ATR courant à sa propre
+    # moyenne récente (ATR_BASELINE_PERIOD bougies) plutôt qu'à un seuil fixe.
+    # Un seuil fixe ne s'adapte pas si le marché devient globalement plus ou
+    # moins volatil sur plusieurs mois — celui-ci s'ajuste tout seul.
+    atr_baseline = average_true_range(candles, ATR_BASELINE_PERIOD)
+    min_atr_required = max(ATR_MIN_THRESHOLD, ATR_RELATIVE_MIN_RATIO * atr_baseline) if atr_baseline else ATR_MIN_THRESHOLD
+    if atr < min_atr_required:
+        log(f"ATR trop faible par rapport à son niveau récent ({atr:.3f} < {min_atr_required:.3f}, "
+            f"moyenne sur {ATR_BASELINE_PERIOD} bougies={atr_baseline}) — marché trop calme, signaux ignorés.")
         save_state({
             **state,
             "last_sma_signal": last_sma_signal,
@@ -610,96 +650,146 @@ def run_once():
             "last_candle_time": current_candle_time,
             "open_trade": open_trade,
             "weekly_trades": weekly_trades,
+            "cooldown_candles_remaining": cooldown_candles_remaining,
         })
         return
 
     alerts_sent = 0
 
-    # --- Signal 1 : croisement SMA ---
-    short_sma = simple_moving_average(closes, SHORT_WINDOW)
-    long_sma = simple_moving_average(closes, LONG_WINDOW)
+    # --- Signal 1 : croisement SMA, filtré par la tendance de fond (SMA50),
+    # l'ampleur du croisement et le cooldown après un SL ---
     if short_sma is not None and long_sma is not None:
         current_sma_signal = "BUY" if short_sma > long_sma else "SELL"
         log(f"SMA : signal actuel={current_sma_signal} (précédent={last_sma_signal}) — SMA{SHORT_WINDOW}={short_sma:.2f} / SMA{LONG_WINDOW}={long_sma:.2f}")
         if last_sma_signal is not None and current_sma_signal != last_sma_signal:
-            # Si une position est encore ouverte (précédent signal SMA ou RSI),
-            # on la clôture au prix courant avant d'en ouvrir une nouvelle —
-            # sinon elle disparaîtrait silencieusement de l'état et du bilan.
-            close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
-            if close_message:
-                sent_close = send_alert(close_message)
-                log(f"Position précédente clôturée avant nouveau signal SMA : {sent_close}")
+            # 1) Le croisement doit être net, pas un frôlement dans le bruit.
+            crossover_margin = abs(short_sma - long_sma)
+            margin_ok = crossover_margin >= MIN_CROSSOVER_ATR_RATIO * atr
+            # 2) On ne prend le signal que s'il va dans le sens de la tendance
+            #    de fond (SMA50) — on évite d'acheter en pleine tendance baissière.
+            trend_ok = trend_sma is not None and (
+                (current_sma_signal == "BUY" and current_price > trend_sma)
+                or (current_sma_signal == "SELL" and current_price < trend_sma)
+            )
+            # 3) On évite d'entrer si le RSI est déjà à bout de course dans le
+            #    sens du signal (acheter alors que le RSI est déjà en surachat, etc.).
+            rsi_ok = rsi is None or not (
+                (current_sma_signal == "BUY" and rsi >= RSI_OVERBOUGHT)
+                or (current_sma_signal == "SELL" and rsi <= RSI_OVERSOLD)
+            )
+            # 4) Pas de nouvelle entrée juste après un SL (cooldown).
+            cooldown_ok = cooldown_candles_remaining == 0
+            # 5) On n'est pas déjà en position dans la même direction (évite
+            #    une clôture + réouverture redondante si SMA et RSI sont d'accord).
+            not_duplicate = not already_in_direction(open_trade, current_sma_signal)
 
-            tp1, tp2, stop_loss = compute_tp_sl(current_sma_signal, current_price, atr)
-            note = f"Signal : croisement SMA{SHORT_WINDOW}/SMA{LONG_WINDOW} (SMA{SHORT_WINDOW}={short_sma:.2f} / SMA{LONG_WINDOW}={long_sma:.2f})"
-            message = format_alert(current_sma_signal, current_price, tp1, tp2, stop_loss, note)
-            sent = send_alert(message)
-            log(f"Alerte SMA envoyée : {sent}")
-            alerts_sent += 1
-            open_trade = {
-                "action": current_sma_signal,
-                "entry": current_price,
-                "tp1": tp1,
-                "tp2": tp2,
-                "sl": stop_loss,
-                "tp1_hit": False,
-                "tp2_hit": False,
-                "closed": False,
-                "entry_time": current_candle_time,
-            }
+            if margin_ok and trend_ok and rsi_ok and cooldown_ok and not_duplicate:
+                # Si une position est encore ouverte (précédent signal SMA ou
+                # RSI), on la clôture au prix courant avant d'en ouvrir une
+                # nouvelle — sinon elle disparaîtrait silencieusement de
+                # l'état et du bilan.
+                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+                if close_message:
+                    sent_close = send_alert(close_message)
+                    log(f"Position précédente clôturée avant nouveau signal SMA : {sent_close}")
+
+                tp1, tp2, stop_loss = compute_tp_sl(current_sma_signal, current_price, atr)
+                note = (
+                    f"Signal : croisement SMA{SHORT_WINDOW}/SMA{LONG_WINDOW} "
+                    f"(SMA{SHORT_WINDOW}={short_sma:.2f} / SMA{LONG_WINDOW}={long_sma:.2f}), "
+                    f"confirmé par la tendance de fond (SMA{TREND_WINDOW})"
+                )
+                message = format_alert(current_sma_signal, current_price, tp1, tp2, stop_loss, note)
+                sent = send_alert(message)
+                log(f"Alerte SMA envoyée : {sent}")
+                alerts_sent += 1
+                open_trade = {
+                    "action": current_sma_signal,
+                    "entry": current_price,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "sl": stop_loss,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "closed": False,
+                    "entry_time": current_candle_time,
+                }
+            else:
+                log(
+                    f"Croisement SMA {current_sma_signal} détecté mais filtré "
+                    f"(marge suffisante={margin_ok}, tendance de fond favorable={trend_ok}, "
+                    f"RSI pas déjà épuisé={rsi_ok}, hors cooldown={cooldown_ok}, "
+                    f"pas déjà en position={not_duplicate})."
+                )
         last_sma_signal = current_sma_signal
 
-    # --- Signal 2 : sortie de zone RSI ---
-    rsi = relative_strength_index(closes, RSI_PERIOD)
+    # --- Signal 2 : sortie de zone RSI, filtré par la tendance de fond (SMA50)
+    # et le cooldown après un SL — on ne prend le retournement que s'il va
+    # dans le sens du fond du marché, pas contre lui. ---
     if rsi is not None:
         current_zone = rsi_zone(rsi)
         log(f"RSI : {rsi:.1f} — zone actuelle={current_zone} (précédente={last_rsi_zone})")
+
         if last_rsi_zone == "oversold" and current_zone == "neutral":
-            close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
-            if close_message:
-                sent_close = send_alert(close_message)
-                log(f"Position précédente clôturée avant nouveau signal RSI (BUY) : {sent_close}")
+            trend_ok = trend_sma is not None and current_price > trend_sma
+            cooldown_ok = cooldown_candles_remaining == 0
+            not_duplicate = not already_in_direction(open_trade, "BUY")
+            if trend_ok and cooldown_ok and not_duplicate:
+                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+                if close_message:
+                    sent_close = send_alert(close_message)
+                    log(f"Position précédente clôturée avant nouveau signal RSI (BUY) : {sent_close}")
 
-            tp1, tp2, stop_loss = compute_tp_sl("BUY", current_price, atr)
-            note = f"Signal : RSI sort de survente (RSI={rsi:.1f})"
-            message = format_alert("BUY", current_price, tp1, tp2, stop_loss, note)
-            sent = send_alert(message)
-            log(f"Alerte RSI (BUY) envoyée : {sent}")
-            alerts_sent += 1
-            open_trade = {
-                "action": "BUY",
-                "entry": current_price,
-                "tp1": tp1,
-                "tp2": tp2,
-                "sl": stop_loss,
-                "tp1_hit": False,
-                "tp2_hit": False,
-                "closed": False,
-                "entry_time": current_candle_time,
-            }
+                tp1, tp2, stop_loss = compute_tp_sl("BUY", current_price, atr)
+                note = f"Signal : RSI sort de survente (RSI={rsi:.1f}), dans le sens de la tendance de fond (SMA{TREND_WINDOW})"
+                message = format_alert("BUY", current_price, tp1, tp2, stop_loss, note)
+                sent = send_alert(message)
+                log(f"Alerte RSI (BUY) envoyée : {sent}")
+                alerts_sent += 1
+                open_trade = {
+                    "action": "BUY",
+                    "entry": current_price,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "sl": stop_loss,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "closed": False,
+                    "entry_time": current_candle_time,
+                }
+            else:
+                log(f"Sortie de survente détectée mais filtrée (tendance de fond favorable={trend_ok}, "
+                    f"hors cooldown={cooldown_ok}, pas déjà en position={not_duplicate}).")
         elif last_rsi_zone == "overbought" and current_zone == "neutral":
-            close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
-            if close_message:
-                sent_close = send_alert(close_message)
-                log(f"Position précédente clôturée avant nouveau signal RSI (SELL) : {sent_close}")
+            trend_ok = trend_sma is not None and current_price < trend_sma
+            cooldown_ok = cooldown_candles_remaining == 0
+            not_duplicate = not already_in_direction(open_trade, "SELL")
+            if trend_ok and cooldown_ok and not_duplicate:
+                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades)
+                if close_message:
+                    sent_close = send_alert(close_message)
+                    log(f"Position précédente clôturée avant nouveau signal RSI (SELL) : {sent_close}")
 
-            tp1, tp2, stop_loss = compute_tp_sl("SELL", current_price, atr)
-            note = f"Signal : RSI sort de surachat (RSI={rsi:.1f})"
-            message = format_alert("SELL", current_price, tp1, tp2, stop_loss, note)
-            sent = send_alert(message)
-            log(f"Alerte RSI (SELL) envoyée : {sent}")
-            alerts_sent += 1
-            open_trade = {
-                "action": "SELL",
-                "entry": current_price,
-                "tp1": tp1,
-                "tp2": tp2,
-                "sl": stop_loss,
-                "tp1_hit": False,
-                "tp2_hit": False,
-                "closed": False,
-                "entry_time": current_candle_time,
-            }
+                tp1, tp2, stop_loss = compute_tp_sl("SELL", current_price, atr)
+                note = f"Signal : RSI sort de surachat (RSI={rsi:.1f}), dans le sens de la tendance de fond (SMA{TREND_WINDOW})"
+                message = format_alert("SELL", current_price, tp1, tp2, stop_loss, note)
+                sent = send_alert(message)
+                log(f"Alerte RSI (SELL) envoyée : {sent}")
+                alerts_sent += 1
+                open_trade = {
+                    "action": "SELL",
+                    "entry": current_price,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "sl": stop_loss,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "closed": False,
+                    "entry_time": current_candle_time,
+                }
+            else:
+                log(f"Sortie de surachat détectée mais filtrée (tendance de fond favorable={trend_ok}, "
+                    f"hors cooldown={cooldown_ok}, pas déjà en position={not_duplicate}).")
         last_rsi_zone = current_zone
 
     if alerts_sent == 0 and not trade_messages:
@@ -712,6 +802,7 @@ def run_once():
         "last_candle_time": current_candle_time,
         "open_trade": open_trade,
         "weekly_trades": weekly_trades,
+        "cooldown_candles_remaining": cooldown_candles_remaining,
     })
     log("=== Fin de la vérification, état sauvegardé ===")
 
