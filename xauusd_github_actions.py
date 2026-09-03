@@ -62,32 +62,24 @@ ATR_TP2_MULTIPLIER = 2.5
 ATR_MIN_THRESHOLD = 0.5  # plancher absolu de sécurité (marché quasiment mort)
 
 # --- Configuration du filtre de qualité des signaux ---
-# Objectif : moins de signaux, mais plus fiables. Trois garde-fous s'ajoutent
-# au croisement SMA et à la sortie de zone RSI bruts :
-TREND_WINDOW = 50               # SMA "de fond" utilisée comme filtre de tendance générale
-ATR_BASELINE_PERIOD = 50        # période de référence pour juger si la volatilité actuelle est normale
-ATR_RELATIVE_MIN_RATIO = 0.6    # l'ATR courant doit valoir au moins 60% de sa moyenne récente
-MIN_CROSSOVER_ATR_RATIO = 0.15  # écart minimum SMA courte/longue au croisement (fraction de l'ATR) pour ignorer les croisements "au ras des pâquerettes"
-SL_COOLDOWN_CANDLES = 3         # nb de bougies (5 min) à attendre après un SL avant d'accepter un nouveau signal
+TREND_WINDOW = 50
+ATR_BASELINE_PERIOD = 50
+ATR_RELATIVE_MIN_RATIO = 0.6
+MIN_CROSSOVER_ATR_RATIO = 0.15
+SL_COOLDOWN_CANDLES = 3
 
 # --- Configuration du suivi de position (pips) ---
-PIP_SIZE = 0.1  # 1 pip = 0.1 sur XAU/USD
+PIP_SIZE = 0.1
 
 # --- Conversion pips -> euros pour le bilan (estimation) ---
-# Base : spécification de contrat standard XAU/USD (100 oz par lot de 1.00),
-# la plus répandue chez les brokers. À 0.01 lot, 1 pip du bot (0,10$ de
-# mouvement) vaut 100 oz x 0.01 x 0,10$ = 0,10$/pip, assimilé ici à 0,10€/pip.
-# C'est une ESTIMATION : elle ne tient pas compte du spread, des commissions,
-# ni du taux de change USD/EUR réel — le contrat exact peut varier selon ton
-# broker (à vérifier dans ses spécifications XAUUSD si besoin de précision).
 PIP_VALUE_EUR_PER_001_LOT = 0.10
 
 # --- Configuration du bilan hebdomadaire ---
-WEEKLY_SUMMARY_WEEKDAY = 4   # 0=lundi ... 4=vendredi
-WEEKLY_SUMMARY_HOUR_UTC = 21  # heure UTC à partir de laquelle on considère le marché fermé
+WEEKLY_SUMMARY_WEEKDAY = 4
+WEEKLY_SUMMARY_HOUR_UTC = 21
 
 # --- Configuration du point marché quotidien ---
-DAILY_BRIEFING_HOUR_UTC = 7  # ~9h à Paris (hors changement d'heure) — ajustable
+DAILY_BRIEFING_HOUR_UTC = 7
 
 STATE_FILE = "state.json"
 SUMMARY_IMAGE_PATH = "weekly_summary.png"
@@ -105,6 +97,7 @@ def load_state():
         "admin_alerted_for_streak": False,
         "last_daily_briefing_date": None,
         "cooldown_candles_remaining": 0,
+        "total_pips_all_time": 0,
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -284,8 +277,7 @@ def pips_between(price_a: float, price_b: float) -> int:
 
 
 def signed_pips(action: str, entry: float, exit_price: float) -> int:
-    """Écart en pips entre l'entrée et un prix de sortie, signé : positif si
-    le trade est gagnant pour la direction prise (BUY ou SELL), négatif sinon."""
+    """Écart en pips entre l'entrée et un prix de sortie, signé."""
     diff = (exit_price - entry) if action == "BUY" else (entry - exit_price)
     return round(diff / PIP_SIZE)
 
@@ -302,8 +294,7 @@ def format_sl_hit(entry: float, sl_price: float) -> str:
 
 def format_manual_close(action: str, entry: float, exit_price: float) -> str:
     """Message envoyé quand une position encore ouverte est clôturée au prix
-    courant parce qu'un nouveau signal (SMA ou RSI) vient d'arriver, pour ne
-    jamais perdre le suivi d'un trade en cours ni fausser le bilan."""
+    courant parce qu'un nouveau signal (SMA ou RSI) vient d'arriver."""
     pips = signed_pips(action, entry, exit_price)
     sign = "+" if pips >= 0 else ""
     emoji = "✅" if pips >= 0 else "❌"
@@ -311,52 +302,39 @@ def format_manual_close(action: str, entry: float, exit_price: float) -> str:
 
 
 def already_in_direction(open_trade, action: str) -> bool:
-    """Vrai si une position est déjà ouverte dans la même direction que le
-    nouveau signal — évite de clôturer puis rouvrir immédiatement la même
-    position (au même prix) si le SMA et le RSI signalent la même direction
-    au même run, ce qui ne ferait qu'envoyer une alerte redondante."""
+    """Vrai si une position est déjà ouverte dans la même direction."""
     return open_trade is not None and not open_trade.get("closed") and open_trade.get("action") == action
 
 
 def event_date(candle_datetime: str) -> str:
-    """Extrait la date (JJ/MM) d'un horodatage de bougie, pour regrouper le
-    bilan par jour dans l'image récapitulative."""
-    date_part = candle_datetime.split(" ")[0]  # "YYYY-MM-DD"
+    """Extrait la date (JJ/MM) d'un horodatage de bougie."""
+    date_part = candle_datetime.split(" ")[0]
     year, month, day = date_part.split("-")
     return f"{day}/{month}"
 
 
-def close_previous_trade_if_open(open_trade, current_price: float, weekly_trades: list, current_candle_time: str):
-    """Si une position est encore ouverte (ni TP2 ni SL touché), la clôture au
-    prix courant AVANT qu'un nouveau signal ne l'écrase dans l'état. Sans ça,
-    un trade en cours disparaît silencieusement : plus aucun message de suivi
-    n'est envoyé au canal, et il n'est jamais compté dans le bilan hebdomadaire
-    (ni gagnant, ni perdant), ce qui fausse le taux de réussite affiché.
-    Renvoie le message à envoyer, ou None s'il n'y avait rien à clôturer."""
+def close_previous_trade_if_open(open_trade, current_price: float, current_candle_time: str):
+    """Clôture une position encore ouverte au prix courant.
+    Renvoie (message, evenement) — (None, None) s'il n'y avait rien à clôturer."""
     if open_trade is None or open_trade.get("closed"):
-        return None
+        return None, None
     message = format_manual_close(open_trade["action"], open_trade["entry"], current_price)
     pips = signed_pips(open_trade["action"], open_trade["entry"], current_price)
-    weekly_trades.append({
+    event = {
         "label": "FLIP",
         "pips": pips,
         "date": event_date(current_candle_time),
         "action": open_trade["action"],
-    })
+    }
     open_trade["closed"] = True
-    return message
+    return message, event
 
 
 def check_open_trade(candles: list, open_trade: dict):
     """
     Vérifie si TP1, TP2 ou le SL de la position ouverte ont été touchés,
-    en examinant le plus haut/plus bas de CHAQUE bougie récupérée (pas
-    seulement le dernier prix de clôture) — ça évite de rater un niveau
-    touché brièvement entre deux vérifications du bot.
+    en examinant le plus haut/plus bas de CHAQUE bougie récupérée.
     Renvoie (messages_a_envoyer, open_trade_mis_a_jour, evenements).
-    Chaque événement est un dict {label, pips, date, action} — la date et la
-    direction (BUY/SELL) permettent de regrouper le bilan par jour et
-    d'afficher "ACHAT OR"/"VENTE OR" dans l'image récapitulative.
     """
     if open_trade is None or open_trade.get("closed"):
         return [], open_trade, []
@@ -368,8 +346,6 @@ def check_open_trade(candles: list, open_trade: dict):
     entry_time = open_trade.get("entry_time", "")
     tp1, tp2, sl = open_trade["tp1"], open_trade["tp2"], open_trade["sl"]
 
-    # On ne regarde que les bougies survenues APRÈS l'ouverture de la position,
-    # pour ne pas déclencher un faux signal à partir de prix antérieurs à l'entrée.
     relevant_candles = [c for c in candles if c["datetime"] > entry_time]
 
     for candle in relevant_candles:
@@ -379,7 +355,6 @@ def check_open_trade(candles: list, open_trade: dict):
         candle_date = event_date(candle["datetime"])
 
         if action == "BUY":
-            # SL prioritaire si le SL et un TP sont touchés dans la même bougie (prudence)
             if not open_trade.get("closed") and low <= sl:
                 messages.append(format_sl_hit(entry, sl))
                 events.append({"label": "SL", "pips": -pips_between(entry, sl), "date": candle_date, "action": action})
@@ -418,12 +393,7 @@ def get_week_id(dt: datetime) -> str:
 
 
 def generate_summary_image(week_id: str, trades: list) -> str:
-    """Génère l'image de bilan hebdomadaire avec Matplotlib et renvoie son chemin.
-    Regroupe les événements réellement enregistrés par le bot, jour par jour
-    (ACHAT OR / VENTE OR, résultat en pips, coche verte ou croix rouge), avec
-    un sous-bilan par jour puis les totaux de la semaine en bas. Uniquement
-    des chiffres réels — rien n'est saisi à la main."""
-    # Compat avec d'anciennes entrées (label, pips) sans date/direction.
+    """Génère l'image de bilan hebdomadaire avec Matplotlib et renvoie son chemin."""
     normalized = []
     for t in trades:
         if isinstance(t, dict):
@@ -433,12 +403,10 @@ def generate_summary_image(week_id: str, trades: list) -> str:
             normalized.append({"label": label, "pips": pips, "date": "?", "action": "?"})
 
     total_pips = sum(t["pips"] for t in normalized)
-    n_flip_win = sum(1 for t in normalized if t["label"] == "FLIP" and t["pips"] >= 0)
     n_wins = sum(1 for t in normalized if t["pips"] >= 0)
     n_total = len(normalized)
     win_rate = (n_wins / n_total * 100) if n_total else 0
 
-    # Regroupement par jour, dans l'ordre d'apparition.
     days = []
     by_day = {}
     for t in normalized:
@@ -456,8 +424,6 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     white = "#e8ecf2"
     grey = "#8a93a3"
 
-    # --- Hauteur calculée dynamiquement pour que rien ne se chevauche,
-    # quel que soit le nombre de jours / trades de la semaine.
     LINE_H = 0.34
     DAY_BILAN_H = 0.42
     DAY_GAP = 0.22
@@ -476,7 +442,6 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     def y_at(offset_from_top):
         return total_h - offset_from_top
 
-    # --- En-tête ---
     cursor = 0.55
     ax.plot(
         [width / 2 - 0.13, width / 2 + 0.13, width / 2 - 0.13, width / 2],
@@ -491,7 +456,6 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     ax.text(width / 2, y_at(cursor), week_id, ha="center", fontsize=10.5, color=grey)
     cursor += 0.4
 
-    # --- Corps : un bloc par jour ---
     box_left, box_right = 0.35, width - 0.35
     if not days:
         ax.text(width / 2, y_at(cursor + 0.35), "Aucune position clôturée cette semaine.", ha="center", fontsize=12, color=grey)
@@ -517,7 +481,6 @@ def generate_summary_image(week_id: str, trades: list) -> str:
         ax.text(width / 2, y_at(cursor), f"BILAN : {day_wins}/{len(day_trades)}", ha="center", fontsize=13.5, fontweight="bold", color=gold, zorder=2)
         cursor += DAY_BILAN_H * 0.25 + DAY_GAP
 
-    # --- Totaux de la semaine ---
     pips_color = green if total_pips >= 0 else red
     sign = "+" if total_pips >= 0 else ""
     total_eur = total_pips * PIP_VALUE_EUR_PER_001_LOT
@@ -556,7 +519,7 @@ def check_and_send_weekly_summary(state: dict) -> bool:
 
     week_id = get_week_id(now)
     if state.get("last_summary_week") == week_id:
-        return False  # déjà envoyé cette semaine
+        return False
 
     trades = state.get("weekly_trades", [])
     log(f"Clôture hebdomadaire détectée ({week_id}) — génération du bilan ({len(trades)} événements).")
@@ -565,15 +528,20 @@ def check_and_send_weekly_summary(state: dict) -> bool:
     total_pips = sum((t["pips"] if isinstance(t, dict) else t[1]) for t in trades)
     total_eur = total_pips * PIP_VALUE_EUR_PER_001_LOT
     sign = "+" if total_pips >= 0 else ""
+
+    total_all_time = state.get("total_pips_all_time", 0)
+    sign_all = "+" if total_all_time >= 0 else ""
+
     caption = (
         f"📊 <b>Bilan de la semaine {week_id}</b>\n"
-        f"Résultat cumulé : {sign}{total_pips} pips (~{sign}{total_eur:.0f}€ en 0.01 lot)"
+        f"Résultat cumulé : {sign}{total_pips} pips (~{sign}{total_eur:.0f}€ en 0.01 lot)\n"
+        f"Total depuis le lancement : {sign_all}{total_all_time} pips"
     )
     sent = send_photo(image_path, caption)
     log(f"Bilan hebdomadaire envoyé : {sent}")
 
     state["last_summary_week"] = week_id
-    state["weekly_trades"] = []  # on repart à zéro pour la semaine suivante
+    state["weekly_trades"] = []
     return True
 
 
@@ -602,14 +570,14 @@ def format_daily_briefing(current_price: float, short_sma: float, long_sma: floa
 def check_and_send_daily_briefing(state: dict, current_price: float, short_sma: float, long_sma: float, rsi: float, atr: float) -> bool:
     """Envoie le point marché quotidien une seule fois par jour ouvré, à l'heure configurée."""
     now = datetime.now(timezone.utc)
-    is_weekday = now.weekday() <= 4  # lundi à vendredi
+    is_weekday = now.weekday() <= 4
     is_briefing_time = now.hour >= DAILY_BRIEFING_HOUR_UTC
     if not (is_weekday and is_briefing_time):
         return False
 
     today_str = now.strftime("%Y-%m-%d")
     if state.get("last_daily_briefing_date") == today_str:
-        return False  # déjà envoyé aujourd'hui
+        return False
 
     message = format_daily_briefing(current_price, short_sma, long_sma, rsi, atr)
     sent = send_alert(message)
@@ -634,11 +602,12 @@ def run_once():
     open_trade = state.get("open_trade")
     weekly_trades = state.get("weekly_trades", [])
     cooldown_candles_remaining = state.get("cooldown_candles_remaining", 0)
+    total_pips_all_time = state.get("total_pips_all_time", 0)
     log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, "
         f"position ouverte={'oui' if open_trade and not open_trade.get('closed') else 'non'}, "
-        f"événements cette semaine={len(weekly_trades)}, cooldown restant={cooldown_candles_remaining}")
+        f"événements cette semaine={len(weekly_trades)}, cooldown restant={cooldown_candles_remaining}, "
+        f"total all-time={total_pips_all_time}")
 
-    # --- Vérification du bilan hebdomadaire (indépendant des données de marché) ---
     summary_sent = check_and_send_weekly_summary(state)
     if summary_sent:
         save_state(state)
@@ -668,7 +637,6 @@ def run_once():
         })
         return
 
-    # Récupération réussie : on remet le compteur d'échecs à zéro
     if state.get("consecutive_failures", 0) > 0:
         log("Récupération des données réussie après une série d'échecs — compteur remis à zéro.")
         if state.get("admin_alerted_for_streak"):
@@ -681,7 +649,6 @@ def run_once():
         log(f"Aucune nouvelle bougie depuis la dernière vérification (marché probablement fermé — {current_candle_time}). On arrête ici, pas de recalcul.")
         return
 
-    # Une nouvelle bougie est arrivée : le cooldown après un SL avance d'un cran.
     if cooldown_candles_remaining > 0:
         cooldown_candles_remaining -= 1
         log(f"Cooldown après SL actif : encore {cooldown_candles_remaining} bougie(s) avant de reprendre de nouvelles entrées.")
@@ -689,13 +656,13 @@ def run_once():
     closes = [c["close"] for c in candles]
     current_price = closes[-1]
 
-    # --- Vérification de la position ouverte (TP1/TP2/SL), sur high/low de chaque bougie ---
     trade_messages, open_trade, trade_events = check_open_trade(candles, open_trade)
     for msg in trade_messages:
         sent = send_alert(msg)
         log(f"Alerte position envoyée ({msg.splitlines()[0]}) : {sent}")
     for event in trade_events:
         weekly_trades.append(event)
+        total_pips_all_time += event["pips"]
         if event["label"] == "SL":
             cooldown_candles_remaining = SL_COOLDOWN_CANDLES
             log(f"SL touché — cooldown de {SL_COOLDOWN_CANDLES} bougies activé avant le prochain signal.")
@@ -711,24 +678,18 @@ def run_once():
             "open_trade": open_trade,
             "weekly_trades": weekly_trades,
             "cooldown_candles_remaining": cooldown_candles_remaining,
+            "total_pips_all_time": total_pips_all_time,
         })
         return
 
-    # Indicateurs calculés une seule fois et réutilisés pour le point quotidien
-    # ET pour les deux signaux ci-dessous (plus de double calcul divergent).
     short_sma = simple_moving_average(closes, SHORT_WINDOW)
     long_sma = simple_moving_average(closes, LONG_WINDOW)
-    trend_sma = simple_moving_average(closes, TREND_WINDOW)  # tendance de fond, filtre de qualité
+    trend_sma = simple_moving_average(closes, TREND_WINDOW)
     rsi = relative_strength_index(closes, RSI_PERIOD)
 
-    # --- Point marché quotidien (indépendant du filtre de volatilité) ---
     if short_sma is not None and long_sma is not None and rsi is not None:
         check_and_send_daily_briefing(state, current_price, short_sma, long_sma, rsi, atr)
 
-    # Filtre de volatilité ADAPTATIF : on compare l'ATR courant à sa propre
-    # moyenne récente (ATR_BASELINE_PERIOD bougies) plutôt qu'à un seuil fixe.
-    # Un seuil fixe ne s'adapte pas si le marché devient globalement plus ou
-    # moins volatil sur plusieurs mois — celui-ci s'ajuste tout seul.
     atr_baseline = average_true_range(candles, ATR_BASELINE_PERIOD)
     min_atr_required = max(ATR_MIN_THRESHOLD, ATR_RELATIVE_MIN_RATIO * atr_baseline) if atr_baseline else ATR_MIN_THRESHOLD
     if atr < min_atr_required:
@@ -742,46 +703,35 @@ def run_once():
             "open_trade": open_trade,
             "weekly_trades": weekly_trades,
             "cooldown_candles_remaining": cooldown_candles_remaining,
+            "total_pips_all_time": total_pips_all_time,
         })
         return
 
     alerts_sent = 0
 
-    # --- Signal 1 : croisement SMA, filtré par la tendance de fond (SMA50),
-    # l'ampleur du croisement et le cooldown après un SL ---
     if short_sma is not None and long_sma is not None:
         current_sma_signal = "BUY" if short_sma > long_sma else "SELL"
         log(f"SMA : signal actuel={current_sma_signal} (précédent={last_sma_signal}) — SMA{SHORT_WINDOW}={short_sma:.2f} / SMA{LONG_WINDOW}={long_sma:.2f}")
         if last_sma_signal is not None and current_sma_signal != last_sma_signal:
-            # 1) Le croisement doit être net, pas un frôlement dans le bruit.
             crossover_margin = abs(short_sma - long_sma)
             margin_ok = crossover_margin >= MIN_CROSSOVER_ATR_RATIO * atr
-            # 2) On ne prend le signal que s'il va dans le sens de la tendance
-            #    de fond (SMA50) — on évite d'acheter en pleine tendance baissière.
             trend_ok = trend_sma is not None and (
                 (current_sma_signal == "BUY" and current_price > trend_sma)
                 or (current_sma_signal == "SELL" and current_price < trend_sma)
             )
-            # 3) On évite d'entrer si le RSI est déjà à bout de course dans le
-            #    sens du signal (acheter alors que le RSI est déjà en surachat, etc.).
             rsi_ok = rsi is None or not (
                 (current_sma_signal == "BUY" and rsi >= RSI_OVERBOUGHT)
                 or (current_sma_signal == "SELL" and rsi <= RSI_OVERSOLD)
             )
-            # 4) Pas de nouvelle entrée juste après un SL (cooldown).
             cooldown_ok = cooldown_candles_remaining == 0
-            # 5) On n'est pas déjà en position dans la même direction (évite
-            #    une clôture + réouverture redondante si SMA et RSI sont d'accord).
             not_duplicate = not already_in_direction(open_trade, current_sma_signal)
 
             if margin_ok and trend_ok and rsi_ok and cooldown_ok and not_duplicate:
-                # Si une position est encore ouverte (précédent signal SMA ou
-                # RSI), on la clôture au prix courant avant d'en ouvrir une
-                # nouvelle — sinon elle disparaîtrait silencieusement de
-                # l'état et du bilan.
-                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades, current_candle_time)
+                close_message, close_event = close_previous_trade_if_open(open_trade, current_price, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
+                    weekly_trades.append(close_event)
+                    total_pips_all_time += close_event["pips"]
                     log(f"Position précédente clôturée avant nouveau signal SMA : {sent_close}")
 
                 tp1, tp2, stop_loss = compute_tp_sl(current_sma_signal, current_price, atr)
@@ -814,9 +764,6 @@ def run_once():
                 )
         last_sma_signal = current_sma_signal
 
-    # --- Signal 2 : sortie de zone RSI, filtré par la tendance de fond (SMA50)
-    # et le cooldown après un SL — on ne prend le retournement que s'il va
-    # dans le sens du fond du marché, pas contre lui. ---
     if rsi is not None:
         current_zone = rsi_zone(rsi)
         log(f"RSI : {rsi:.1f} — zone actuelle={current_zone} (précédente={last_rsi_zone})")
@@ -826,9 +773,11 @@ def run_once():
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "BUY")
             if trend_ok and cooldown_ok and not_duplicate:
-                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades, current_candle_time)
+                close_message, close_event = close_previous_trade_if_open(open_trade, current_price, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
+                    weekly_trades.append(close_event)
+                    total_pips_all_time += close_event["pips"]
                     log(f"Position précédente clôturée avant nouveau signal RSI (BUY) : {sent_close}")
 
                 tp1, tp2, stop_loss = compute_tp_sl("BUY", current_price, atr)
@@ -856,9 +805,11 @@ def run_once():
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "SELL")
             if trend_ok and cooldown_ok and not_duplicate:
-                close_message = close_previous_trade_if_open(open_trade, current_price, weekly_trades, current_candle_time)
+                close_message, close_event = close_previous_trade_if_open(open_trade, current_price, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
+                    weekly_trades.append(close_event)
+                    total_pips_all_time += close_event["pips"]
                     log(f"Position précédente clôturée avant nouveau signal RSI (SELL) : {sent_close}")
 
                 tp1, tp2, stop_loss = compute_tp_sl("SELL", current_price, atr)
@@ -894,6 +845,7 @@ def run_once():
         "open_trade": open_trade,
         "weekly_trades": weekly_trades,
         "cooldown_candles_remaining": cooldown_candles_remaining,
+        "total_pips_all_time": total_pips_all_time,
     })
     log("=== Fin de la vérification, état sauvegardé ===")
 
