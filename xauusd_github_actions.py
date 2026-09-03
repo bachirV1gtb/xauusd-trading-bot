@@ -62,11 +62,15 @@ ATR_TP2_MULTIPLIER = 2.5
 ATR_MIN_THRESHOLD = 0.5  # plancher absolu de sécurité (marché quasiment mort)
 
 # --- Configuration du filtre de qualité des signaux ---
+# Réglages resserrés pour privilégier moins de signaux, mais mieux confirmés.
+# Aucun réglage ne garantit un taux de réussite : ceci réduit le bruit, pas le risque.
 TREND_WINDOW = 50
+TREND_SLOPE_LOOKBACK = 10       # nb de bougies en arrière pour juger si la tendance de fond progresse vraiment
 ATR_BASELINE_PERIOD = 50
-ATR_RELATIVE_MIN_RATIO = 0.6
-MIN_CROSSOVER_ATR_RATIO = 0.15
-SL_COOLDOWN_CANDLES = 3
+ATR_RELATIVE_MIN_RATIO = 0.8    # volatilité courante exigée plus proche de la normale (avant : 0.6)
+MIN_CROSSOVER_ATR_RATIO = 0.35  # croisement SMA plus net exigé (avant : 0.15)
+RSI_SIGNAL_BUFFER = 5           # marge de sécurité sous 70 / au-dessus de 30 avant de rejeter un signal
+SL_COOLDOWN_CANDLES = 5         # cooldown après un SL allongé (avant : 3)
 
 # --- Configuration du suivi de position (pips) ---
 PIP_SIZE = 0.1
@@ -687,6 +691,13 @@ def run_once():
     trend_sma = simple_moving_average(closes, TREND_WINDOW)
     rsi = relative_strength_index(closes, RSI_PERIOD)
 
+    # Pente de la tendance de fond : le SMA50 doit vraiment progresser dans le
+    # bon sens (pas juste être au-dessus/en dessous du prix par inertie), pour
+    # éviter de suivre un signal contre un marché qui plafonne ou s'essouffle.
+    trend_sma_prev = None
+    if len(closes) >= TREND_WINDOW + TREND_SLOPE_LOOKBACK:
+        trend_sma_prev = simple_moving_average(closes[:-TREND_SLOPE_LOOKBACK], TREND_WINDOW)
+
     if short_sma is not None and long_sma is not None and rsi is not None:
         check_and_send_daily_briefing(state, current_price, short_sma, long_sma, rsi, atr)
 
@@ -715,13 +726,17 @@ def run_once():
         if last_sma_signal is not None and current_sma_signal != last_sma_signal:
             crossover_margin = abs(short_sma - long_sma)
             margin_ok = crossover_margin >= MIN_CROSSOVER_ATR_RATIO * atr
-            trend_ok = trend_sma is not None and (
+            trend_slope_ok = trend_sma_prev is not None and (
+                (current_sma_signal == "BUY" and trend_sma > trend_sma_prev)
+                or (current_sma_signal == "SELL" and trend_sma < trend_sma_prev)
+            )
+            trend_ok = trend_sma is not None and trend_slope_ok and (
                 (current_sma_signal == "BUY" and current_price > trend_sma)
                 or (current_sma_signal == "SELL" and current_price < trend_sma)
             )
             rsi_ok = rsi is None or not (
-                (current_sma_signal == "BUY" and rsi >= RSI_OVERBOUGHT)
-                or (current_sma_signal == "SELL" and rsi <= RSI_OVERSOLD)
+                (current_sma_signal == "BUY" and rsi >= RSI_OVERBOUGHT - RSI_SIGNAL_BUFFER)
+                or (current_sma_signal == "SELL" and rsi <= RSI_OVERSOLD + RSI_SIGNAL_BUFFER)
             )
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, current_sma_signal)
@@ -769,7 +784,8 @@ def run_once():
         log(f"RSI : {rsi:.1f} — zone actuelle={current_zone} (précédente={last_rsi_zone})")
 
         if last_rsi_zone == "oversold" and current_zone == "neutral":
-            trend_ok = trend_sma is not None and current_price > trend_sma
+            trend_slope_ok = trend_sma_prev is not None and trend_sma > trend_sma_prev
+            trend_ok = trend_sma is not None and trend_slope_ok and current_price > trend_sma
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "BUY")
             if trend_ok and cooldown_ok and not_duplicate:
@@ -801,7 +817,8 @@ def run_once():
                 log(f"Sortie de survente détectée mais filtrée (tendance de fond favorable={trend_ok}, "
                     f"hors cooldown={cooldown_ok}, pas déjà en position={not_duplicate}).")
         elif last_rsi_zone == "overbought" and current_zone == "neutral":
-            trend_ok = trend_sma is not None and current_price < trend_sma
+            trend_slope_ok = trend_sma_prev is not None and trend_sma < trend_sma_prev
+            trend_ok = trend_sma is not None and trend_slope_ok and current_price < trend_sma
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "SELL")
             if trend_ok and cooldown_ok and not_duplicate:
