@@ -40,7 +40,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # optionnel : notif privée à l'admin
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "TradePulse38Bot")
-AVATRADE_LINK = os.environ.get("AVATRADE_LINK", "[LIEN_AVATRADE_A_CONFIGURER]")
+VTMARKETS_LINK = os.environ.get("VTMARKETS_LINK", "https://www.vtmarkets.com/trade-now/?utm_source=promo&utm_medium=social&utm_campaign=RAF&utm_term=NA&utm_content=NA&c=F9vORspqDcbRngh10H6f8A%3D%3D")
+
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_GET_UPDATES_URL = f"{TELEGRAM_API}/getUpdates"
@@ -61,12 +62,19 @@ WELCOME_MESSAGE = (
     "Bienvenue sur XAU Guardian !\n\n"
     "Tu vas recevoir dans le canal des alertes automatiques sur l'or "
     "(XAU/USD), générées par un bot qui analyse le marché en continu.\n\n"
-    "Envie de trader ces alertes avec un broker fiable ?\n"
-    f"Inscris-toi via mon lien partenaire AvaTrade : {AVATRADE_LINK}\n"
-    "(aucun surcoût pour toi, ça soutient le canal)\n\n"
+    "🎁 BONUS DE BIENVENUE 100% sur votre premier dépôt (jusqu'à 1 000 $) "
+    "+ 20% sur vos dépôts suivants (jusqu'à 10 000 $ au total) !\n\n"
+    f"👉 {VTMARKETS_LINK}\n\n"
+    "⚡ Ouverture de compte rapide\n"
+    "💰 Plus de capital pour trader\n"
+    "📈 Idéal pour accompagner nos signaux XAU Guardian\n\n"
+    "ℹ Le bonus doit être débloqué via un volume de trading (voir "
+    "conditions sur le site). Offre soumise aux T&C de VT Markets.\n\n"
+    "⚠️ Le trading comporte des risques, tradez de manière responsable.\n\n"
     "Tu peux aussi me poser tes questions ici en privé — tape \"aide\" "
     "pour voir ce que je sais expliquer automatiquement."
 )
+
 
 FAQ = [
     (["aide", "help", "menu", "commande"], (
@@ -95,11 +103,13 @@ FAQ = [
         "estimation basée sur une spécification de contrat standard, hors "
         "spread et commissions."
     )),
-    (["broker", "inscription", "inscrire", "compte", "avatrade", "parrain"], (
+        (["broker", "inscription", "inscrire", "compte", "vtmarkets", "parrain"], (
         "Pour trader ces alertes avec un broker, inscris-toi via mon lien "
-        f"partenaire :\n{AVATRADE_LINK}\n"
-        "Ça ne coûte rien de plus et ça soutient le canal."
+        f"partenaire VT Markets :\n{VTMARKETS_LINK}\n"
+        "Bonus de 100% sur ton premier dépôt (jusqu'à 1000$). Ça ne coûte "
+        "rien de plus et ça soutient le canal."
     )),
+
     (["risque", "risk", "combien miser", "combien trader", "taille"], (
         "Rappel important : ne mise jamais plus que ce que tu peux te permettre "
         "de perdre. Les alertes sont informatives, ce n'est pas un conseil "
