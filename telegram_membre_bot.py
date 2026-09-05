@@ -68,8 +68,7 @@ WELCOME_MESSAGE = (
     "⚡ Ouverture de compte rapide\n"
     "💰 Plus de capital pour trader\n"
     "📈 Idéal pour accompagner nos signaux XAU Guardian\n\n"
-    "ℹ Le bonus doit être débloqué via un volume de trading (voir "
-    "conditions sur le site). Offre soumise aux T&C de VT Markets.\n\n"
+
     "⚠️ Le trading comporte des risques, tradez de manière responsable.\n\n"
     "Tu peux aussi me poser tes questions ici en privé — tape \"aide\" "
     "pour voir ce que je sais expliquer automatiquement."
