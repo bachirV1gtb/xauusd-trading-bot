@@ -68,11 +68,17 @@ WELCOME_MESSAGE = (
     "⚡ Ouverture de compte rapide\n"
     "💰 Plus de capital pour trader\n"
     "📈 Idéal pour accompagner nos signaux XAU Guardian\n\n"
-
+    "ℹ️ Le bonus doit être débloqué via un volume de trading (voir "
+    "conditions sur le site). Offre soumise aux T&C de VT Markets.\n\n"
     "⚠️ Le trading comporte des risques, tradez de manière responsable.\n\n"
+    "📚 Envie d'apprendre le trading en plus de suivre nos alertes ? "
+    "Découvre \"Le Prompt Formation Trading — De Zéro à Autonome\", un "
+    "prompt qui transforme ton IA en formateur trading personnel : "
+    "14,99€ → https://mezraoui.gumroad.com/l/trade20\n\n"
     "Tu peux aussi me poser tes questions ici en privé — tape \"aide\" "
     "pour voir ce que je sais expliquer automatiquement."
 )
+
 
 
 FAQ = [
@@ -102,15 +108,21 @@ FAQ = [
         "estimation basée sur une spécification de contrat standard, hors "
         "spread et commissions."
     )),
-        (["broker", "inscription", "inscrire", "compte", "vtmarkets", "parrain"], (
+      (["broker", "inscription", "inscrire", "compte", "vtmarkets", "parrain"], (
         "Pour trader ces alertes avec un broker, inscris-toi via mon lien "
         f"partenaire VT Markets :\n{VTMARKETS_LINK}\n"
         "Bonus de 100% sur ton premier dépôt (jusqu'à 1000$). Ça ne coûte "
         "rien de plus et ça soutient le canal."
     )),
 
+    (["formation", "apprendre", "prompt", "cours"], (
+        "Pour apprendre le trading en profondeur, découvre \"Le Prompt "
+        "Formation Trading — De Zéro à Autonome\" : 14,99€ → "
+        "https://mezraoui.gumroad.com/l/trade20"
+    )),
+
     (["risque", "risk", "combien miser", "combien trader", "taille"], (
-        "Rappel important : ne mise jamais plus que ce que tu peux te permettre "
+       "Rappel important : ne mise jamais plus que ce que tu peux te permettre "
         "de perdre. Les alertes sont informatives, ce n'est pas un conseil "
         "financier personnalisé. Adapte toujours la taille de ta position à "
         "ton capital et à ta tolérance au risque."
