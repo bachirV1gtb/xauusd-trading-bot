@@ -1,0 +1,47 @@
+name: Exécution bot range/imbalance (démo)
+
+on:
+  schedule:
+    # 12:15 UTC = 15:15 heure serveur broker (décalage actuel : +3h)
+    # ⚠️ À revérifier après chaque changement d'heure été/hiver (chez toi ET
+    # chez le broker) avec check_session_time.py — l'écart peut varier de ±1h
+    # pendant quelques semaines autour des transitions.
+    - cron: "15 12 * * 1-5"
+  workflow_dispatch: {}   # permet de le déclencher manuellement pour tester
+
+jobs:
+  run-bot:
+    runs-on: windows-latest
+    timeout-minutes: 170
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install MetaTrader5
+
+      - name: Télécharger et installer MetaTrader 5
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile "mt5setup.exe"
+          Start-Process -FilePath "mt5setup.exe" -ArgumentList "/auto" -Wait
+
+      - name: Localiser terminal64.exe (debug)
+        shell: powershell
+        run: |
+          Get-ChildItem -Path "$env:ProgramFiles","$env:APPDATA" -Filter "terminal64.exe" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object FullName
+
+      - name: Lancer le bot
+        shell: powershell
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_PATH: ${{ secrets.MT5_PATH }}
+        run: python xauguardian_ci_bot.py
