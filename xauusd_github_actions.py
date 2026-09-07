@@ -55,10 +55,16 @@ RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 
 # --- Configuration Take Profit / Stop Loss (basé sur l'ATR) ---
+# Ratio risque/récompense corrigé : avant, TP1=1.0xATR pour un SL=1.5xATR
+# exigeait déjà 60% de réussite juste pour être à l'équilibre sur TP1 seul.
+# Ici, TP1=1.5xATR pour un SL=1.2xATR ne demande plus que ~44% de réussite
+# pour être rentable sur TP1 seul — nettement plus tolérant aux séries
+# perdantes normales. Ceci NE garantit aucun taux de réussite : ça rend la
+# stratégie mathématiquement plus indulgente, pas infaillible.
 ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 1.5
-ATR_TP1_MULTIPLIER = 1.0
-ATR_TP2_MULTIPLIER = 2.5
+ATR_SL_MULTIPLIER = 1.2
+ATR_TP1_MULTIPLIER = 1.5
+ATR_TP2_MULTIPLIER = 3.0
 ATR_MIN_THRESHOLD = 0.5  # plancher absolu de sécurité (marché quasiment mort)
 
 # --- Configuration du filtre de qualité des signaux ---
@@ -71,6 +77,7 @@ ATR_RELATIVE_MIN_RATIO = 0.8    # volatilité courante exigée plus proche de la
 MIN_CROSSOVER_ATR_RATIO = 0.35  # croisement SMA plus net exigé (avant : 0.15)
 RSI_SIGNAL_BUFFER = 5           # marge de sécurité sous 70 / au-dessus de 30 avant de rejeter un signal
 SL_COOLDOWN_CANDLES = 5         # cooldown après un SL allongé (avant : 3)
+DAILY_SIGNAL_LIMIT = 3          # max de NOUVELLES entrées par jour (hors suivi TP/SL de position déjà ouverte)
 
 # --- Configuration du suivi de position (pips) ---
 PIP_SIZE = 0.1
@@ -102,6 +109,8 @@ def load_state():
         "last_daily_briefing_date": None,
         "cooldown_candles_remaining": 0,
         "total_pips_all_time": 0,
+        "alerts_sent_today": 0,
+        "alerts_sent_date": None,
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -607,10 +616,18 @@ def run_once():
     weekly_trades = state.get("weekly_trades", [])
     cooldown_candles_remaining = state.get("cooldown_candles_remaining", 0)
     total_pips_all_time = state.get("total_pips_all_time", 0)
+
+    # Compteur d'alertes du jour : remis à zéro si on a changé de jour calendaire (UTC).
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.get("alerts_sent_date") != today_str:
+        alerts_sent_today = 0
+    else:
+        alerts_sent_today = state.get("alerts_sent_today", 0)
+
     log(f"État précédent chargé : last_sma_signal={last_sma_signal}, last_rsi_zone={last_rsi_zone}, "
         f"position ouverte={'oui' if open_trade and not open_trade.get('closed') else 'non'}, "
         f"événements cette semaine={len(weekly_trades)}, cooldown restant={cooldown_candles_remaining}, "
-        f"total all-time={total_pips_all_time}")
+        f"total all-time={total_pips_all_time}, alertes aujourd'hui={alerts_sent_today}/{DAILY_SIGNAL_LIMIT}")
 
     summary_sent = check_and_send_weekly_summary(state)
     if summary_sent:
@@ -683,6 +700,8 @@ def run_once():
             "weekly_trades": weekly_trades,
             "cooldown_candles_remaining": cooldown_candles_remaining,
             "total_pips_all_time": total_pips_all_time,
+            "alerts_sent_today": alerts_sent_today,
+            "alerts_sent_date": today_str,
         })
         return
 
@@ -715,6 +734,8 @@ def run_once():
             "weekly_trades": weekly_trades,
             "cooldown_candles_remaining": cooldown_candles_remaining,
             "total_pips_all_time": total_pips_all_time,
+            "alerts_sent_today": alerts_sent_today,
+            "alerts_sent_date": today_str,
         })
         return
 
@@ -740,8 +761,9 @@ def run_once():
             )
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, current_sma_signal)
+            daily_limit_ok = alerts_sent_today < DAILY_SIGNAL_LIMIT
 
-            if margin_ok and trend_ok and rsi_ok and cooldown_ok and not_duplicate:
+            if margin_ok and trend_ok and rsi_ok and cooldown_ok and not_duplicate and daily_limit_ok:
                 close_message, close_event = close_previous_trade_if_open(open_trade, current_price, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
@@ -759,6 +781,7 @@ def run_once():
                 sent = send_alert(message)
                 log(f"Alerte SMA envoyée : {sent}")
                 alerts_sent += 1
+                alerts_sent_today += 1
                 open_trade = {
                     "action": current_sma_signal,
                     "entry": current_price,
@@ -775,7 +798,7 @@ def run_once():
                     f"Croisement SMA {current_sma_signal} détecté mais filtré "
                     f"(marge suffisante={margin_ok}, tendance de fond favorable={trend_ok}, "
                     f"RSI pas déjà épuisé={rsi_ok}, hors cooldown={cooldown_ok}, "
-                    f"pas déjà en position={not_duplicate})."
+                    f"pas déjà en position={not_duplicate}, sous la limite quotidienne={daily_limit_ok})."
                 )
         last_sma_signal = current_sma_signal
 
@@ -788,7 +811,8 @@ def run_once():
             trend_ok = trend_sma is not None and trend_slope_ok and current_price > trend_sma
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "BUY")
-            if trend_ok and cooldown_ok and not_duplicate:
+            daily_limit_ok = alerts_sent_today < DAILY_SIGNAL_LIMIT
+            if trend_ok and cooldown_ok and not_duplicate and daily_limit_ok:
                 close_message, close_event = close_previous_trade_if_open(open_trade, current_price, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
@@ -802,6 +826,7 @@ def run_once():
                 sent = send_alert(message)
                 log(f"Alerte RSI (BUY) envoyée : {sent}")
                 alerts_sent += 1
+                alerts_sent_today += 1
                 open_trade = {
                     "action": "BUY",
                     "entry": current_price,
@@ -815,13 +840,14 @@ def run_once():
                 }
             else:
                 log(f"Sortie de survente détectée mais filtrée (tendance de fond favorable={trend_ok}, "
-                    f"hors cooldown={cooldown_ok}, pas déjà en position={not_duplicate}).")
+                    f"hors cooldown={cooldown_ok}, pas déjà en position={not_duplicate}, sous la limite quotidienne={daily_limit_ok}).")
         elif last_rsi_zone == "overbought" and current_zone == "neutral":
             trend_slope_ok = trend_sma_prev is not None and trend_sma < trend_sma_prev
             trend_ok = trend_sma is not None and trend_slope_ok and current_price < trend_sma
             cooldown_ok = cooldown_candles_remaining == 0
             not_duplicate = not already_in_direction(open_trade, "SELL")
-            if trend_ok and cooldown_ok and not_duplicate:
+            daily_limit_ok = alerts_sent_today < DAILY_SIGNAL_LIMIT
+            if trend_ok and cooldown_ok and not_duplicate and daily_limit_ok:
                 close_message, close_event = close_previous_trade_if_open(open_trade, current_price, current_candle_time)
                 if close_message:
                     sent_close = send_alert(close_message)
@@ -835,6 +861,7 @@ def run_once():
                 sent = send_alert(message)
                 log(f"Alerte RSI (SELL) envoyée : {sent}")
                 alerts_sent += 1
+                alerts_sent_today += 1
                 open_trade = {
                     "action": "SELL",
                     "entry": current_price,
@@ -848,7 +875,7 @@ def run_once():
                 }
             else:
                 log(f"Sortie de surachat détectée mais filtrée (tendance de fond favorable={trend_ok}, "
-                    f"hors cooldown={cooldown_ok}, pas déjà en position={not_duplicate}).")
+                    f"hors cooldown={cooldown_ok}, pas déjà en position={not_duplicate}, sous la limite quotidienne={daily_limit_ok}).")
         last_rsi_zone = current_zone
 
     if alerts_sent == 0 and not trade_messages:
@@ -863,6 +890,8 @@ def run_once():
         "weekly_trades": weekly_trades,
         "cooldown_candles_remaining": cooldown_candles_remaining,
         "total_pips_all_time": total_pips_all_time,
+        "alerts_sent_today": alerts_sent_today,
+        "alerts_sent_date": today_str,
     })
     log("=== Fin de la vérification, état sauvegardé ===")
 
