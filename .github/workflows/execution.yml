@@ -31,11 +31,11 @@ jobs:
           Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile "mt5setup.exe"
           Start-Process -FilePath "mt5setup.exe" -ArgumentList "/auto" -Wait
 
-      - name: Localiser terminal64.exe (debug)
+      - name: Lancer MetaTrader 5 en arrière-plan
         shell: powershell
         run: |
-          Get-ChildItem -Path "$env:ProgramFiles","$env:APPDATA" -Filter "terminal64.exe" -Recurse -ErrorAction SilentlyContinue |
-            Select-Object FullName
+          Start-Process -FilePath "C:\Program Files\MetaTrader 5\terminal64.exe"
+          Start-Sleep -Seconds 30
 
       - name: Lancer le bot
         shell: powershell
