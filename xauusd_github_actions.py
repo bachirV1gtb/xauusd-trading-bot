@@ -10,6 +10,12 @@ Différences avec la version "PC" :
   sauvegardé dans state.json, commité dans le dépôt entre deux exécutions.
 - BOT_TOKEN, TWELVEDATA_API_KEY et CHANNEL_ID sont lus depuis les variables
   d'environnement (GitHub Secrets), jamais écrits en clair dans ce fichier.
+
+Ajout : chaque signal envoyé sur Telegram est aussi enregistré dans Firestore
+(collection "signals"), pour que le site XAU Guardian puisse les afficher
+sur le tableau de bord des membres. Si FIREBASE_SERVICE_ACCOUNT n'est pas
+configuré, cette partie est simplement ignorée (le bot continue de fonctionner
+normalement, seul l'affichage sur le site sera vide).
 """
 
 import os
@@ -22,6 +28,13 @@ from datetime import datetime, timezone
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
 
 
 def log(message):
@@ -45,6 +58,9 @@ SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
+# --- Configuration Firestore (site web) ---
+FIREBASE_SERVICE_ACCOUNT = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+
 # --- Configuration SMA ---
 SHORT_WINDOW = 5
 LONG_WINDOW = 13
@@ -55,29 +71,21 @@ RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 
 # --- Configuration Take Profit / Stop Loss (basé sur l'ATR) ---
-# Ratio risque/récompense corrigé : avant, TP1=1.0xATR pour un SL=1.5xATR
-# exigeait déjà 60% de réussite juste pour être à l'équilibre sur TP1 seul.
-# Ici, TP1=1.5xATR pour un SL=1.2xATR ne demande plus que ~44% de réussite
-# pour être rentable sur TP1 seul — nettement plus tolérant aux séries
-# perdantes normales. Ceci NE garantit aucun taux de réussite : ça rend la
-# stratégie mathématiquement plus indulgente, pas infaillible.
 ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.2
 ATR_TP1_MULTIPLIER = 1.5
 ATR_TP2_MULTIPLIER = 3.0
-ATR_MIN_THRESHOLD = 0.5  # plancher absolu de sécurité (marché quasiment mort)
+ATR_MIN_THRESHOLD = 0.5
 
 # --- Configuration du filtre de qualité des signaux ---
-# Réglages resserrés pour privilégier moins de signaux, mais mieux confirmés.
-# Aucun réglage ne garantit un taux de réussite : ceci réduit le bruit, pas le risque.
 TREND_WINDOW = 50
-TREND_SLOPE_LOOKBACK = 10       # nb de bougies en arrière pour juger si la tendance de fond progresse vraiment
+TREND_SLOPE_LOOKBACK = 10
 ATR_BASELINE_PERIOD = 50
-ATR_RELATIVE_MIN_RATIO = 0.8    # volatilité courante exigée plus proche de la normale (avant : 0.6)
-MIN_CROSSOVER_ATR_RATIO = 0.35  # croisement SMA plus net exigé (avant : 0.15)
-RSI_SIGNAL_BUFFER = 5           # marge de sécurité sous 70 / au-dessus de 30 avant de rejeter un signal
-SL_COOLDOWN_CANDLES = 5         # cooldown après un SL allongé (avant : 3)
-DAILY_SIGNAL_LIMIT = 3          # max de NOUVELLES entrées par jour (hors suivi TP/SL de position déjà ouverte)
+ATR_RELATIVE_MIN_RATIO = 0.8
+MIN_CROSSOVER_ATR_RATIO = 0.35
+RSI_SIGNAL_BUFFER = 5
+SL_COOLDOWN_CANDLES = 5
+DAILY_SIGNAL_LIMIT = 3
 
 # --- Configuration du suivi de position (pips) ---
 PIP_SIZE = 0.1
@@ -94,6 +102,81 @@ DAILY_BRIEFING_HOUR_UTC = 7
 
 STATE_FILE = "state.json"
 SUMMARY_IMAGE_PATH = "weekly_summary.png"
+
+_firestore_db = None
+_firestore_init_attempted = False
+
+
+def get_firestore_db():
+    """Initialise Firebase Admin une seule fois et renvoie le client Firestore.
+    Renvoie None si non configuré ou en cas d'échec (le bot continue sans planter)."""
+    global _firestore_db, _firestore_init_attempted
+    if _firestore_init_attempted:
+        return _firestore_db
+    _firestore_init_attempted = True
+
+    if not FIREBASE_AVAILABLE:
+        log("firebase-admin non installé, synchronisation Firestore désactivée.")
+        return None
+    if not FIREBASE_SERVICE_ACCOUNT:
+        log("FIREBASE_SERVICE_ACCOUNT non configuré, synchronisation Firestore désactivée.")
+        return None
+
+    try:
+        cred_dict = json.loads(FIREBASE_SERVICE_ACCOUNT)
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        _firestore_db = firestore.client()
+        log("Connexion Firestore initialisée avec succès.")
+        return _firestore_db
+    except Exception as e:
+        log(f"Erreur d'initialisation Firestore (le bot continue normalement) : {e}")
+        return None
+
+
+def save_signal_to_firestore(action, entry, tp1, tp2, sl, note, candle_time):
+    """Crée un nouveau document dans la collection 'signals'. Renvoie l'ID du
+    document créé (à conserver pour les mises à jour TP/SL), ou None si échec."""
+    db = get_firestore_db()
+    if db is None:
+        return None
+    try:
+        doc_ref = db.collection("signals").document()
+        doc_ref.set({
+            "symbol": SYMBOL,
+            "action": action,
+            "entry": entry,
+            "tp1": tp1,
+            "tp2": tp2,
+            "sl": sl,
+            "note": note,
+            "candle_time": candle_time,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "open",
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "closed": False,
+            "result_pips": None,
+        })
+        log(f"Signal enregistré dans Firestore (id={doc_ref.id}).")
+        return doc_ref.id
+    except Exception as e:
+        log(f"Erreur d'écriture Firestore (signal ignoré côté site, le bot continue) : {e}")
+        return None
+
+
+def update_signal_in_firestore(doc_id, updates: dict):
+    """Met à jour un document existant de la collection 'signals'."""
+    if not doc_id:
+        return
+    db = get_firestore_db()
+    if db is None:
+        return
+    try:
+        db.collection("signals").document(doc_id).update(updates)
+        log(f"Signal Firestore mis à jour (id={doc_id}) : {updates}")
+    except Exception as e:
+        log(f"Erreur de mise à jour Firestore (le bot continue) : {e}")
 
 
 def load_state():
@@ -131,15 +214,10 @@ def save_state(state: dict):
 
 
 def send_admin_alert(message: str) -> bool:
-    """Envoie un message privé à l'administrateur (toi), séparé du canal public."""
     if not ADMIN_CHAT_ID:
         log("ADMIN_CHAT_ID non configuré, alerte de panne non envoyée (mais consignée dans les logs).")
         return False
-    payload = {
-        "chat_id": ADMIN_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": ADMIN_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         response = requests.post(TELEGRAM_SEND_MESSAGE_URL, data=payload, timeout=10)
         response.raise_for_status()
@@ -285,12 +363,10 @@ def compute_tp_sl(action: str, entry_price: float, atr: float):
 
 
 def pips_between(price_a: float, price_b: float) -> int:
-    """Calcule l'écart entre deux prix en pips (1 pip = PIP_SIZE)."""
     return round(abs(price_a - price_b) / PIP_SIZE)
 
 
 def signed_pips(action: str, entry: float, exit_price: float) -> int:
-    """Écart en pips entre l'entrée et un prix de sortie, signé."""
     diff = (exit_price - entry) if action == "BUY" else (entry - exit_price)
     return round(diff / PIP_SIZE)
 
@@ -306,8 +382,6 @@ def format_sl_hit(entry: float, sl_price: float) -> str:
 
 
 def format_manual_close(action: str, entry: float, exit_price: float) -> str:
-    """Message envoyé quand une position encore ouverte est clôturée au prix
-    courant parce qu'un nouveau signal (SMA ou RSI) vient d'arriver."""
     pips = signed_pips(action, entry, exit_price)
     sign = "+" if pips >= 0 else ""
     emoji = "✅" if pips >= 0 else "❌"
@@ -315,20 +389,16 @@ def format_manual_close(action: str, entry: float, exit_price: float) -> str:
 
 
 def already_in_direction(open_trade, action: str) -> bool:
-    """Vrai si une position est déjà ouverte dans la même direction."""
     return open_trade is not None and not open_trade.get("closed") and open_trade.get("action") == action
 
 
 def event_date(candle_datetime: str) -> str:
-    """Extrait la date (JJ/MM) d'un horodatage de bougie."""
     date_part = candle_datetime.split(" ")[0]
     year, month, day = date_part.split("-")
     return f"{day}/{month}"
 
 
 def close_previous_trade_if_open(open_trade, current_price: float, current_candle_time: str):
-    """Clôture une position encore ouverte au prix courant.
-    Renvoie (message, evenement) — (None, None) s'il n'y avait rien à clôturer."""
     if open_trade is None or open_trade.get("closed"):
         return None, None
     message = format_manual_close(open_trade["action"], open_trade["entry"], current_price)
@@ -340,15 +410,15 @@ def close_previous_trade_if_open(open_trade, current_price: float, current_candl
         "action": open_trade["action"],
     }
     open_trade["closed"] = True
+    update_signal_in_firestore(open_trade.get("firestore_id"), {
+        "closed": True,
+        "status": "closed_flip",
+        "result_pips": pips,
+    })
     return message, event
 
 
 def check_open_trade(candles: list, open_trade: dict):
-    """
-    Vérifie si TP1, TP2 ou le SL de la position ouverte ont été touchés,
-    en examinant le plus haut/plus bas de CHAQUE bougie récupérée.
-    Renvoie (messages_a_envoyer, open_trade_mis_a_jour, evenements).
-    """
     if open_trade is None or open_trade.get("closed"):
         return [], open_trade, []
 
@@ -358,6 +428,7 @@ def check_open_trade(candles: list, open_trade: dict):
     entry = open_trade["entry"]
     entry_time = open_trade.get("entry_time", "")
     tp1, tp2, sl = open_trade["tp1"], open_trade["tp2"], open_trade["sl"]
+    firestore_id = open_trade.get("firestore_id")
 
     relevant_candles = [c for c in candles if c["datetime"] > entry_time]
 
@@ -370,43 +441,49 @@ def check_open_trade(candles: list, open_trade: dict):
         if action == "BUY":
             if not open_trade.get("closed") and low <= sl:
                 messages.append(format_sl_hit(entry, sl))
-                events.append({"label": "SL", "pips": -pips_between(entry, sl), "date": candle_date, "action": action})
+                pips = -pips_between(entry, sl)
+                events.append({"label": "SL", "pips": pips, "date": candle_date, "action": action})
                 open_trade["closed"] = True
+                update_signal_in_firestore(firestore_id, {"closed": True, "status": "sl_hit", "result_pips": pips})
                 continue
             if not open_trade.get("tp1_hit") and high >= tp1:
                 messages.append(format_tp_hit("TP1", entry, tp1))
                 events.append({"label": "TP1", "pips": pips_between(entry, tp1), "date": candle_date, "action": action})
                 open_trade["tp1_hit"] = True
+                update_signal_in_firestore(firestore_id, {"tp1_hit": True, "status": "tp1_hit"})
             if not open_trade.get("tp2_hit") and high >= tp2:
                 messages.append(format_tp_hit("TP2", entry, tp2))
                 events.append({"label": "TP2", "pips": pips_between(entry, tp2), "date": candle_date, "action": action})
                 open_trade["tp2_hit"] = True
+                update_signal_in_firestore(firestore_id, {"tp2_hit": True, "status": "tp2_hit"})
         else:  # SELL
             if not open_trade.get("closed") and high >= sl:
                 messages.append(format_sl_hit(entry, sl))
-                events.append({"label": "SL", "pips": -pips_between(entry, sl), "date": candle_date, "action": action})
+                pips = -pips_between(entry, sl)
+                events.append({"label": "SL", "pips": pips, "date": candle_date, "action": action})
                 open_trade["closed"] = True
+                update_signal_in_firestore(firestore_id, {"closed": True, "status": "sl_hit", "result_pips": pips})
                 continue
             if not open_trade.get("tp1_hit") and low <= tp1:
                 messages.append(format_tp_hit("TP1", entry, tp1))
                 events.append({"label": "TP1", "pips": pips_between(entry, tp1), "date": candle_date, "action": action})
                 open_trade["tp1_hit"] = True
+                update_signal_in_firestore(firestore_id, {"tp1_hit": True, "status": "tp1_hit"})
             if not open_trade.get("tp2_hit") and low <= tp2:
                 messages.append(format_tp_hit("TP2", entry, tp2))
                 events.append({"label": "TP2", "pips": pips_between(entry, tp2), "date": candle_date, "action": action})
                 open_trade["tp2_hit"] = True
+                update_signal_in_firestore(firestore_id, {"tp2_hit": True, "status": "tp2_hit"})
 
     return messages, open_trade, events
 
 
 def get_week_id(dt: datetime) -> str:
-    """Identifiant unique de semaine ISO (année + numéro de semaine)."""
     iso = dt.isocalendar()
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
 def generate_summary_image(week_id: str, trades: list) -> str:
-    """Génère l'image de bilan hebdomadaire avec Matplotlib et renvoie son chemin."""
     normalized = []
     for t in trades:
         if isinstance(t, dict):
@@ -523,8 +600,6 @@ def generate_summary_image(week_id: str, trades: list) -> str:
 
 
 def check_and_send_weekly_summary(state: dict) -> bool:
-    """Si on est en fin de semaine (clôture du marché) et que le bilan n'a pas
-    encore été envoyé cette semaine, génère et envoie l'image. Renvoie True si envoyé."""
     now = datetime.now(timezone.utc)
     is_closing_time = now.weekday() == WEEKLY_SUMMARY_WEEKDAY and now.hour >= WEEKLY_SUMMARY_HOUR_UTC
     if not is_closing_time:
@@ -559,7 +634,6 @@ def check_and_send_weekly_summary(state: dict) -> bool:
 
 
 def format_daily_briefing(current_price: float, short_sma: float, long_sma: float, rsi: float, atr: float) -> str:
-    """Message purement descriptif — état du marché, pas une recommandation d'achat/vente."""
     trend = "haussière 🟢" if short_sma > long_sma else "baissière 🔴"
     if rsi >= RSI_OVERBOUGHT:
         rsi_zone_label = "surachat"
@@ -581,7 +655,6 @@ def format_daily_briefing(current_price: float, short_sma: float, long_sma: floa
 
 
 def check_and_send_daily_briefing(state: dict, current_price: float, short_sma: float, long_sma: float, rsi: float, atr: float) -> bool:
-    """Envoie le point marché quotidien une seule fois par jour ouvré, à l'heure configurée."""
     now = datetime.now(timezone.utc)
     is_weekday = now.weekday() <= 4
     is_briefing_time = now.hour >= DAILY_BRIEFING_HOUR_UTC
@@ -617,7 +690,6 @@ def run_once():
     cooldown_candles_remaining = state.get("cooldown_candles_remaining", 0)
     total_pips_all_time = state.get("total_pips_all_time", 0)
 
-    # Compteur d'alertes du jour : remis à zéro si on a changé de jour calendaire (UTC).
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.get("alerts_sent_date") != today_str:
         alerts_sent_today = 0
@@ -710,9 +782,6 @@ def run_once():
     trend_sma = simple_moving_average(closes, TREND_WINDOW)
     rsi = relative_strength_index(closes, RSI_PERIOD)
 
-    # Pente de la tendance de fond : le SMA50 doit vraiment progresser dans le
-    # bon sens (pas juste être au-dessus/en dessous du prix par inertie), pour
-    # éviter de suivre un signal contre un marché qui plafonne ou s'essouffle.
     trend_sma_prev = None
     if len(closes) >= TREND_WINDOW + TREND_SLOPE_LOOKBACK:
         trend_sma_prev = simple_moving_average(closes[:-TREND_SLOPE_LOOKBACK], TREND_WINDOW)
@@ -782,6 +851,7 @@ def run_once():
                 log(f"Alerte SMA envoyée : {sent}")
                 alerts_sent += 1
                 alerts_sent_today += 1
+                firestore_id = save_signal_to_firestore(current_sma_signal, current_price, tp1, tp2, stop_loss, note, current_candle_time)
                 open_trade = {
                     "action": current_sma_signal,
                     "entry": current_price,
@@ -792,6 +862,7 @@ def run_once():
                     "tp2_hit": False,
                     "closed": False,
                     "entry_time": current_candle_time,
+                    "firestore_id": firestore_id,
                 }
             else:
                 log(
@@ -827,6 +898,7 @@ def run_once():
                 log(f"Alerte RSI (BUY) envoyée : {sent}")
                 alerts_sent += 1
                 alerts_sent_today += 1
+                firestore_id = save_signal_to_firestore("BUY", current_price, tp1, tp2, stop_loss, note, current_candle_time)
                 open_trade = {
                     "action": "BUY",
                     "entry": current_price,
@@ -837,6 +909,7 @@ def run_once():
                     "tp2_hit": False,
                     "closed": False,
                     "entry_time": current_candle_time,
+                    "firestore_id": firestore_id,
                 }
             else:
                 log(f"Sortie de survente détectée mais filtrée (tendance de fond favorable={trend_ok}, "
@@ -862,6 +935,7 @@ def run_once():
                 log(f"Alerte RSI (SELL) envoyée : {sent}")
                 alerts_sent += 1
                 alerts_sent_today += 1
+                firestore_id = save_signal_to_firestore("SELL", current_price, tp1, tp2, stop_loss, note, current_candle_time)
                 open_trade = {
                     "action": "SELL",
                     "entry": current_price,
@@ -872,6 +946,7 @@ def run_once():
                     "tp2_hit": False,
                     "closed": False,
                     "entry_time": current_candle_time,
+                    "firestore_id": firestore_id,
                 }
             else:
                 log(f"Sortie de surachat détectée mais filtrée (tendance de fond favorable={trend_ok}, "
