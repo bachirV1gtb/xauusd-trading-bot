@@ -41,6 +41,7 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # optionnel : notif privée à l'admin
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "TradePulse38Bot")
 VTMARKETS_LINK = os.environ.get("VTMARKETS_LINK", "https://www.vtmarkets.com/trade-now/?utm_source=promo&utm_medium=social&utm_campaign=RAF&utm_term=NA&utm_content=NA&c=F9vORspqDcbRngh10H6f8A%3D%3D")
+XAU_GUARDIAN_SITE = os.environ.get("XAU_GUARDIAN_SITE", "https://bachirv1gtb.github.io/xau-guardian-site/")
 
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -55,11 +56,13 @@ CHANNEL_INVITE_TEXT = (
     "Pour recevoir le message de bienvenue en privé, débloquer l'offre de "
     "notre broker partenaire et pouvoir poser tes questions, clique ici :\n"
     f"https://t.me/{BOT_USERNAME}?start=welcome\n\n"
+    f"🌐 Notre site : {XAU_GUARDIAN_SITE}\n\n"
     "Les alertes automatiques suivent juste en dessous. Bon trading !"
 )
 
 WELCOME_MESSAGE = (
     "Bienvenue sur XAU Guardian !\n\n"
+    f"🌐 Retrouve toutes nos alertes et nos stats en direct sur notre site : {XAU_GUARDIAN_SITE}\n\n"
     "Tu vas recevoir dans le canal des alertes automatiques sur l'or "
     "(XAU/USD), générées par un bot qui analyse le marché en continu.\n\n"
     "🎁 BONUS DE BIENVENUE 100% sur votre premier dépôt (jusqu'à 1 000 $) "
@@ -72,10 +75,6 @@ WELCOME_MESSAGE = (
     "ℹ️ Le bonus doit être débloqué via un volume de trading (voir "
     "conditions sur le site). Offre soumise aux T&C de VT Markets.\n\n"
     "⚠️ Le trading comporte des risques, tradez de manière responsable.\n\n"
-    "📚 Envie d'apprendre le trading en plus de suivre nos alertes ? "
-    "Découvre \"Le Prompt Formation Trading — De Zéro à Autonome\", un "
-    "prompt qui transforme ton IA en formateur trading personnel : "
-    "14,99€ → https://mezraoui.gumroad.com/l/trade20\n\n"
     "Tu peux aussi me poser tes questions ici en privé — tape \"aide\" "
     "pour voir ce que je sais expliquer automatiquement."
 )
@@ -89,7 +88,8 @@ FAQ = [
         "- \"pips\" : comment est calculé un pip sur XAU/USD\n"
         "- \"broker\" / \"inscription\" : comment s'inscrire via le lien partenaire\n"
         "- \"risque\" : rappel sur la gestion du risque\n"
-        "- \"horaires\" : quand le marché est ouvert"
+        "- \"horaires\" : quand le marché est ouvert\n"
+        "- \"site\" : le lien de notre site"
     )),
     (["tp1", "tp2", "take profit"], (
         "TP1 et TP2 sont des objectifs de prix (\"Take Profit\") où une partie des "
@@ -116,12 +116,6 @@ FAQ = [
         "rien de plus et ça soutient le canal."
     )),
 
-    (["formation", "apprendre", "prompt", "cours"], (
-        "Pour apprendre le trading en profondeur, découvre \"Le Prompt "
-        "Formation Trading — De Zéro à Autonome\" : 14,99€ → "
-        "https://mezraoui.gumroad.com/l/trade20"
-    )),
-
     (["risque", "risk", "combien miser", "combien trader", "taille"], (
        "Rappel important : ne mise jamais plus que ce que tu peux te permettre "
         "de perdre. Les alertes sont informatives, ce n'est pas un conseil "
@@ -132,6 +126,10 @@ FAQ = [
         "Le marché de l'or (XAU/USD) est ouvert du dimanche soir au vendredi "
         "soir avec une courte pause chaque jour. Le bot ne génère pas d'alertes "
         "quand le marché est fermé."
+    )),
+    (["site", "web", "website"], (
+        f"Notre site : {XAU_GUARDIAN_SITE}\n"
+        "Tu y retrouves toutes les alertes et les stats en direct."
     )),
 ]
 
