@@ -681,6 +681,10 @@ def run_once():
 
     log("Secrets bien reçus (BOT_TOKEN, CHANNEL_ID, TWELVEDATA_API_KEY présents).")
 
+    # Vérifie la connexion Firestore dès le départ (log de confirmation),
+    # même si aucun signal n'est envoyé cette fois-ci.
+    get_firestore_db()
+
     state = load_state()
     last_sma_signal = state.get("last_sma_signal")
     last_rsi_zone = state.get("last_rsi_zone")
