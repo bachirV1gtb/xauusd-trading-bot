@@ -265,6 +265,10 @@ def send_photo(image_path: str, caption: str) -> bool:
 
 
 def format_alert(action: str, price: float, levels: list, stop_loss: float, note: str = "") -> str:
+    # Le paramètre "note" (détail du signal SMA/RSI) est conservé dans la
+    # signature pour ne pas casser les appels existants et reste enregistré
+    # dans Firestore pour le site, mais n'est plus inclus dans le message
+    # Telegram : le canal ne doit afficher que l'action, les paliers et le SL.
     emoji = "🟢" if action == "BUY" else "🔴"
     action_label = "J'ACHÈTE" if action == "BUY" else "JE VENDS"
     levels_lines = "\n".join(f"🎯 P{i+1} : {lvl:.0f}" for i, lvl in enumerate(levels))
@@ -273,8 +277,6 @@ def format_alert(action: str, price: float, levels: list, stop_loss: float, note
         f"{levels_lines}\n\n"
         f"🔒 SL : {stop_loss:.0f}"
     )
-    if note:
-        msg += f"\n\n{note}"
     return msg
 
 
