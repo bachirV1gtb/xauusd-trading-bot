@@ -107,6 +107,17 @@ PIP_VALUE_EUR_PER_001_LOT = 0.10
 WEEKLY_SUMMARY_WEEKDAY = 4
 WEEKLY_SUMMARY_HOUR_UTC = 21
 
+# --- Configuration du bilan mensuel (complète le bilan hebdo avec une vue
+# plus large : tendance sur le mois, meilleur/pire jour, progression du
+# taux de réussite semaine par semaine) ---
+MONTHLY_SUMMARY_DAY = 1              # envoyé le 1er de chaque mois...
+MONTHLY_SUMMARY_HOUR_UTC = 21        # ...à partir de 21h UTC
+MONTHLY_SUMMARY_IMAGE_PATH = "monthly_summary.png"
+MONTH_NAMES_FR = [
+    "", "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+]
+
 # --- Configuration du point marché quotidien ---
 DAILY_BRIEFING_HOUR_UTC = 7
 
@@ -195,6 +206,7 @@ def load_state():
         "open_trade": None,
         "weekly_trades": [],
         "last_summary_week": None,
+        "last_summary_month": None,
         "consecutive_failures": 0,
         "admin_alerted_for_streak": False,
         "last_daily_briefing_date": None,
@@ -598,7 +610,204 @@ def generate_summary_image(week_id: str, trades: list) -> str:
     return SUMMARY_IMAGE_PATH
 
 
-def check_and_send_weekly_summary(state: dict) -> bool:
+def classify_signal(doc: dict):
+    """Reprend la même logique honnête que stats.html : une position ne
+    compte comme 'gagnante' que si elle n'a jamais touché le SL. Renvoie
+    (pips_realises, resultat, est_cloturee)."""
+    levels = doc.get("levels") or []
+    levels_hit = doc.get("levels_hit") or []
+    entry = doc.get("entry")
+    status = doc.get("status") or ""
+    closed = bool(doc.get("closed"))
+
+    pips = 0
+    any_level_hit = False
+    for idx, hit in enumerate(levels_hit):
+        if hit and idx < len(levels) and entry is not None:
+            pips += pips_between(entry, levels[idx])
+            any_level_hit = True
+
+    hit_sl = "sl_hit" in status
+    result_pips = doc.get("result_pips")
+    if hit_sl and isinstance(result_pips, (int, float)):
+        pips += result_pips
+    elif status == "closed_flip" and isinstance(result_pips, (int, float)):
+        pips += result_pips
+
+    outcome = "open"
+    if closed:
+        if hit_sl and not any_level_hit:
+            outcome = "loss"
+        elif not hit_sl:
+            outcome = "win"
+        else:
+            outcome = "mixed"
+
+    return pips, outcome, closed
+
+
+def generate_monthly_summary_image(month_id: str, signals: list) -> str:
+    year, month = month_id.split("-")
+    month_label = f"{MONTH_NAMES_FR[int(month)]} {year}"
+
+    closed = []
+    for doc in signals:
+        pips, outcome, is_closed = classify_signal(doc)
+        if is_closed:
+            day = (doc.get("candle_time") or "").split(" ")[0]
+            closed.append({"pips": pips, "outcome": outcome, "day": day})
+
+    n_total = len(closed)
+    n_wins = sum(1 for c in closed if c["outcome"] == "win")
+    total_pips = sum(c["pips"] for c in closed)
+    win_rate = (n_wins / n_total * 100) if n_total else 0
+
+    # Meilleur / pire jour : on cumule les pips réalisés par jour d'ouverture.
+    by_day = {}
+    for c in closed:
+        by_day.setdefault(c["day"], 0)
+        by_day[c["day"]] += c["pips"]
+    best_day = max(by_day.items(), key=lambda kv: kv[1]) if by_day else None
+    worst_day = min(by_day.items(), key=lambda kv: kv[1]) if by_day else None
+
+    # Tendance semaine par semaine dans le mois (buckets de 7 jours calendaires).
+    buckets = {}
+    for c in closed:
+        try:
+            day_num = int(c["day"].split("-")[2])
+        except (IndexError, ValueError):
+            continue
+        bucket = (day_num - 1) // 7 + 1
+        b = buckets.setdefault(bucket, {"pips": 0, "wins": 0, "total": 0})
+        b["pips"] += c["pips"]
+        b["total"] += 1
+        if c["outcome"] == "win":
+            b["wins"] += 1
+
+    bg = "#0d0f16"
+    panel = "#171a24"
+    gold = "#c6a34e"
+    green = "#2ecc71"
+    red = "#e74c3c"
+    white = "#e8ecf2"
+    grey = "#8a93a3"
+
+    fig = plt.figure(figsize=(8, 7.2), facecolor=bg)
+    gs = fig.add_gridspec(2, 1, height_ratios=[2.5, 1.3], hspace=0.35)
+
+    ax_top = fig.add_subplot(gs[0])
+    ax_top.axis("off")
+    ax_top.set_xlim(0, 8)
+    ax_top.set_ylim(0, 5)
+
+    ax_top.text(4, 4.65, "XAU GUARDIAN", ha="center", fontsize=20, fontweight="bold", color=gold)
+    ax_top.text(4, 4.2, f"BILAN MENSUEL — {month_label.upper()}", ha="center", fontsize=13.5, fontweight="bold", color=white)
+
+    pips_color = green if total_pips >= 0 else red
+    sign = "+" if total_pips >= 0 else ""
+
+    ax_top.add_patch(plt.Rectangle((0.3, 2.6), 7.4, 1.35, facecolor=panel, edgecolor="none"))
+    ax_top.text(1.9, 3.55, "Positions", ha="center", fontsize=9.5, color=grey)
+    ax_top.text(1.9, 3.05, f"{n_total}", ha="center", fontsize=19, fontweight="bold", color=white)
+    ax_top.text(4, 3.55, "Taux de réussite", ha="center", fontsize=9.5, color=grey)
+    ax_top.text(4, 3.05, f"{win_rate:.0f}%" if n_total else "—", ha="center", fontsize=19, fontweight="bold", color=gold)
+    ax_top.text(6.1, 3.55, "Pips cumulés", ha="center", fontsize=9.5, color=grey)
+    ax_top.text(6.1, 3.05, f"{sign}{total_pips}", ha="center", fontsize=19, fontweight="bold", color=pips_color)
+
+    if best_day:
+        ax_top.text(1.9, 2.05, "Meilleur jour", ha="center", fontsize=9.5, color=grey)
+        ax_top.text(1.9, 1.6, f"{best_day[0]}  ({'+' if best_day[1] >= 0 else ''}{best_day[1]} pips)", ha="center", fontsize=11.5, fontweight="bold", color=green)
+    if worst_day:
+        ax_top.text(6.1, 2.05, "Jour le plus difficile", ha="center", fontsize=9.5, color=grey)
+        ax_top.text(6.1, 1.6, f"{worst_day[0]}  ({'+' if worst_day[1] >= 0 else ''}{worst_day[1]} pips)", ha="center", fontsize=11.5, fontweight="bold", color=red)
+
+    if not closed:
+        ax_top.text(4, 1.0, "Aucune position clôturée ce mois-ci.", ha="center", fontsize=11, color=grey)
+
+    ax_top.text(4, 0.35, "Résultats réels du bot, calculés automatiquement — informatif uniquement, pas un conseil financier.",
+                ha="center", fontsize=7.6, color=grey)
+
+    ax_bottom = fig.add_subplot(gs[1])
+    ax_bottom.set_facecolor(bg)
+    if buckets:
+        weeks = sorted(buckets.keys())
+        pips_vals = [buckets[w]["pips"] for w in weeks]
+        colors = [green if v >= 0 else red for v in pips_vals]
+        ax_bottom.bar([f"Sem. {w}" for w in weeks], pips_vals, color=colors)
+        for i, w in enumerate(weeks):
+            b = buckets[w]
+            wr = (b["wins"] / b["total"] * 100) if b["total"] else 0
+            ax_bottom.text(i, pips_vals[i], f"{wr:.0f}%", ha="center",
+                            va="bottom" if pips_vals[i] >= 0 else "top", fontsize=8.5, color=white)
+        ax_bottom.axhline(0, color="#444", linewidth=0.8)
+        ax_bottom.set_title("Tendance semaine par semaine (pips et % de réussite)", color=white, fontsize=10.5)
+    else:
+        ax_bottom.axis("off")
+    ax_bottom.tick_params(colors=grey, labelsize=8.5)
+    for spine in ax_bottom.spines.values():
+        spine.set_color("#333")
+
+    fig.savefig(MONTHLY_SUMMARY_IMAGE_PATH, facecolor=bg, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return MONTHLY_SUMMARY_IMAGE_PATH, n_total, n_wins, win_rate, total_pips
+
+
+def check_and_send_monthly_summary(state: dict) -> bool:
+    now = datetime.now(timezone.utc)
+    is_monthly_time = now.day == MONTHLY_SUMMARY_DAY and now.hour >= MONTHLY_SUMMARY_HOUR_UTC
+    if not is_monthly_time:
+        return False
+
+    if now.month == 1:
+        target_year, target_month = now.year - 1, 12
+    else:
+        target_year, target_month = now.year, now.month - 1
+    month_id = f"{target_year}-{target_month:02d}"
+
+    if state.get("last_summary_month") == month_id:
+        return False
+
+    db = get_firestore_db()
+    if db is None:
+        log("Firestore non configuré, bilan mensuel ignoré pour cette fois.")
+        return False
+
+    start_dt = datetime(target_year, target_month, 1, tzinfo=timezone.utc)
+    if target_month == 12:
+        end_dt = datetime(target_year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end_dt = datetime(target_year, target_month + 1, 1, tzinfo=timezone.utc)
+
+    try:
+        query = (
+            db.collection("signals")
+            .where("created_at", ">=", start_dt.isoformat())
+            .where("created_at", "<", end_dt.isoformat())
+        )
+        signals = [doc.to_dict() for doc in query.stream()]
+    except Exception as e:
+        log(f"Erreur de lecture Firestore pour le bilan mensuel : {e}")
+        return False
+
+    log(f"Génération du bilan mensuel pour {month_id} ({len(signals)} signal(aux) trouvé(s)).")
+    image_path, n_total, n_wins, win_rate, total_pips = generate_monthly_summary_image(month_id, signals)
+
+    month_label = f"{MONTH_NAMES_FR[target_month]} {target_year}"
+    sign = "+" if total_pips >= 0 else ""
+    caption = (
+        f"📊 <b>Bilan du mois — {month_label}</b>\n"
+        f"{n_wins}/{n_total} positions gagnantes ({win_rate:.0f}%)\n"
+        f"Résultat cumulé : {sign}{total_pips} pips"
+    )
+    sent = send_photo(image_path, caption)
+    log(f"Bilan mensuel envoyé : {sent}")
+
+    if sent:
+        state["last_summary_month"] = month_id
+    return sent
+
+
+
     now = datetime.now(timezone.utc)
     is_closing_time = now.weekday() == WEEKLY_SUMMARY_WEEKDAY and now.hour >= WEEKLY_SUMMARY_HOUR_UTC
     if not is_closing_time:
@@ -708,6 +917,12 @@ def run_once():
     if summary_sent:
         save_state(state)
         log("=== Fin de la vérification (bilan hebdomadaire envoyé) ===")
+        return
+
+    monthly_sent = check_and_send_monthly_summary(state)
+    if monthly_sent:
+        save_state(state)
+        log("=== Fin de la vérification (bilan mensuel envoyé) ===")
         return
 
     min_candles_required = max(LONG_WINDOW, RSI_PERIOD + 1, TREND_WINDOW, ATR_BASELINE_PERIOD + 1)
