@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import mplfinance as mpf
+import pandas as pd
 
 try:
     import firebase_admin
@@ -99,6 +101,10 @@ DAILY_SIGNAL_LIMIT = 3
 
 # --- Configuration du suivi de position (pips) ---
 PIP_SIZE = 0.1
+
+# --- Configuration du graphique d'alerte (chandelles + niveaux) ---
+CHART_CANDLE_COUNT = 40
+ALERT_CHART_PATH = "alert_chart.png"
 
 # --- Conversion pips -> euros pour le bilan (estimation) ---
 PIP_VALUE_EUR_PER_001_LOT = 0.10
@@ -311,6 +317,7 @@ def fetch_candles():
             return None
         candles = [
             {
+                "open": float(c["open"]),
                 "high": float(c["high"]),
                 "low": float(c["low"]),
                 "close": float(c["close"]),
@@ -384,6 +391,94 @@ def compute_ladder(action: str, entry_price: float, atr: float):
 
 def pips_between(price_a: float, price_b: float) -> int:
     return round(abs(price_a - price_b) / PIP_SIZE)
+
+
+def generate_alert_chart(candles: list, action: str, entry_price: float, levels: list, stop_loss: float) -> str:
+    """Graphique en chandelles (style MT5) des bougies récentes, avec
+    l'entrée, les paliers P1-P6 et le SL repérés. Les niveaux trop loin du
+    prix actuel pour tenir dans le cadre sont résumés en note compacte
+    plutôt que d'étirer l'axe et d'écraser les bougies."""
+    window = candles[-CHART_CANDLE_COUNT:] if len(candles) >= CHART_CANDLE_COUNT else candles
+
+    df = pd.DataFrame(
+        {
+            "Open": [c["open"] for c in window],
+            "High": [c["high"] for c in window],
+            "Low": [c["low"] for c in window],
+            "Close": [c["close"] for c in window],
+        },
+        index=pd.to_datetime([c["datetime"] for c in window]),
+    )
+
+    bg = "#0d0f16"
+    green = "#26a69a"
+    red = "#ef5350"
+    white = "#e8ecf2"
+    grey = "#8a93a3"
+    level_green = "#2ecc71"
+
+    mc = mpf.make_marketcolors(up=green, down=red, edge="inherit", wick="inherit")
+    style = mpf.make_mpf_style(
+        base_mpf_style="nightclouds", marketcolors=mc,
+        facecolor=bg, figcolor=bg, gridcolor="#20263a", gridstyle="--", y_on_right=True,
+        rc={"font.size": 9, "text.color": white, "axes.labelcolor": white,
+            "xtick.color": grey, "ytick.color": grey},
+    )
+
+    price_min = min(c["low"] for c in window)
+    price_max = max(c["high"] for c in window)
+    margin = (price_max - price_min) * 0.25 or 1.0
+    view_min = price_min - margin
+    view_max = price_max + margin
+
+    visible_levels = [(i, lvl) for i, lvl in enumerate(levels) if view_min <= lvl <= view_max]
+    sl_visible = view_min <= stop_loss <= view_max
+
+    hlines_vals = [entry_price] + [lvl for _, lvl in visible_levels]
+    hlines_colors = [white] + [level_green] * len(visible_levels)
+    hlines_styles = ["-"] + ["--"] * len(visible_levels)
+    hlines_widths = [1.3] + [1.0] * len(visible_levels)
+    if sl_visible:
+        hlines_vals.append(stop_loss)
+        hlines_colors.append(red)
+        hlines_styles.append("--")
+        hlines_widths.append(1.3)
+
+    fig, axlist = mpf.plot(
+        df, type="candle", style=style, volume=False,
+        hlines=dict(hlines=hlines_vals, colors=hlines_colors, linestyle=hlines_styles, linewidths=hlines_widths),
+        returnfig=True, figsize=(9, 5.2), tight_layout=True, title="",
+    )
+
+    ax = axlist[0]
+    ax.set_ylim(view_min, view_max)
+    action_label = "ACHAT" if action == "BUY" else "VENTE"
+    ax.set_title(f"{action_label} {SYMBOL} — vue récente", color=white, fontsize=13.5,
+                 fontweight="bold", loc="left", pad=12)
+
+    label_x = ax.get_xlim()[1] + 0.6
+    ax.text(label_x, entry_price, f"ENTRÉE {entry_price:.0f}", color=white, fontsize=9, va="center", fontweight="bold")
+    for i, lvl in visible_levels:
+        ax.text(label_x, lvl, f"P{i + 1}  {lvl:.0f}", color=level_green, fontsize=8.5, va="center", fontweight="bold")
+    if sl_visible:
+        ax.text(label_x, stop_loss, f"SL  {stop_loss:.0f}", color=red, fontsize=9, va="center", fontweight="bold")
+
+    offscreen_notes = []
+    if not sl_visible:
+        offscreen_notes.append((f"SL {stop_loss:.0f} (encore {pips_between(entry_price, stop_loss)} pips plus loin)", red))
+    hidden_levels = [lvl for i, lvl in enumerate(levels) if lvl > view_max] if action == "BUY" else [lvl for i, lvl in enumerate(levels) if lvl < view_min]
+    if hidden_levels:
+        first_hidden = len(visible_levels) + 1
+        offscreen_notes.append((f"P{first_hidden} à P{LADDER_LEVELS} plus loin (jusqu'à {hidden_levels[-1]:.0f})", level_green))
+
+    y0 = 0.04
+    for note, color in offscreen_notes:
+        ax.annotate(note, xy=(0.01, y0), xycoords="axes fraction", color=color, fontsize=8.3, fontweight="bold")
+        y0 -= 0.05
+
+    fig.savefig(ALERT_CHART_PATH, facecolor=bg, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return ALERT_CHART_PATH
 
 
 def signed_pips(action: str, entry: float, exit_price: float) -> int:
@@ -480,7 +575,7 @@ def check_open_trade(candles: list, open_trade: dict):
                 messages.append(format_level_hit(level_name, entry, level))
                 events.append({"label": level_name, "pips": pips_between(entry, level), "date": candle_date, "action": action})
                 levels_hit[idx] = True
-                update_signal_in_firestore(firestore_id, {f"levels_hit.{idx}": True, "status": f"{level_name.lower()}_hit"})
+                update_signal_in_firestore(firestore_id, {"levels_hit": levels_hit, "status": f"{level_name.lower()}_hit"})
 
         if all(levels_hit):
             open_trade["closed"] = True
@@ -1065,7 +1160,8 @@ def run_once():
                     f"confirmé par la tendance de fond (SMA{TREND_WINDOW})"
                 )
                 message = format_alert(current_sma_signal, current_price, levels, stop_loss, note)
-                sent = send_alert(message)
+                chart_path = generate_alert_chart(candles, current_sma_signal, current_price, levels, stop_loss)
+                sent = send_photo(chart_path, message)
                 log(f"Alerte SMA envoyée : {sent}")
                 alerts_sent += 1
                 alerts_sent_today += 1
@@ -1110,7 +1206,8 @@ def run_once():
                 levels, stop_loss = compute_ladder("BUY", current_price, atr)
                 note = f"Signal : RSI sort de survente (RSI={rsi:.1f}), dans le sens de la tendance de fond (SMA{TREND_WINDOW})"
                 message = format_alert("BUY", current_price, levels, stop_loss, note)
-                sent = send_alert(message)
+                chart_path = generate_alert_chart(candles, "BUY", current_price, levels, stop_loss)
+                sent = send_photo(chart_path, message)
                 log(f"Alerte RSI (BUY) envoyée : {sent}")
                 alerts_sent += 1
                 alerts_sent_today += 1
@@ -1145,7 +1242,8 @@ def run_once():
                 levels, stop_loss = compute_ladder("SELL", current_price, atr)
                 note = f"Signal : RSI sort de surachat (RSI={rsi:.1f}), dans le sens de la tendance de fond (SMA{TREND_WINDOW})"
                 message = format_alert("SELL", current_price, levels, stop_loss, note)
-                sent = send_alert(message)
+                chart_path = generate_alert_chart(candles, "SELL", current_price, levels, stop_loss)
+                sent = send_photo(chart_path, message)
                 log(f"Alerte RSI (SELL) envoyée : {sent}")
                 alerts_sent += 1
                 alerts_sent_today += 1
