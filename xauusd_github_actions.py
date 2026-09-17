@@ -5,8 +5,8 @@ Sortie en ÉCHELLE DE PALIERS (P1 à P6, espacés proportionnellement à l'ATR)
 au lieu de TP1/TP2/TP3 — variante validée par backtest (90.9% de réussite,
 +12556 pips sur 90 jours) et adoptée en remplacement de l'ancienne sortie.
 
-Suivi des positions (paliers touchés, SL) + bilan hebdomadaire en image
-envoyé automatiquement à la clôture du marché (vendredi soir, ~21h UTC).
+Suivi des positions (paliers touchés, SL) + bilan mensuel en image envoyé
+automatiquement le 1er de chaque mois (~21h UTC).
 
 Différences avec la version "PC" :
 - S'exécute UNE SEULE FOIS par lancement (GitHub Actions le relance périodiquement).
@@ -283,10 +283,6 @@ def send_photo(image_path: str, caption: str) -> bool:
 
 
 def format_alert(action: str, price: float, levels: list, stop_loss: float, note: str = "") -> str:
-    # Le paramètre "note" (détail du signal SMA/RSI) est conservé dans la
-    # signature pour ne pas casser les appels existants et reste enregistré
-    # dans Firestore pour le site, mais n'est plus inclus dans le message
-    # Telegram : le canal ne doit afficher que l'action, les paliers et le SL.
     emoji = "🟢" if action == "BUY" else "🔴"
     action_label = "J'ACHÈTE" if action == "BUY" else "JE VENDS"
     levels_lines = "\n".join(f"🎯 P{i+1} : {lvl:.0f}" for i, lvl in enumerate(levels))
@@ -376,8 +372,6 @@ def rsi_zone(rsi_value):
 
 
 def compute_ladder(action: str, entry_price: float, atr: float):
-    """Calcule les niveaux de paliers (P1..P6) et le SL, espacés
-    proportionnellement à l'ATR — logique validée par backtest_ladder.py."""
     step = LADDER_STEP_ATR_RATIO * atr
     sl_distance = LADDER_SL_ATR_RATIO * atr
     if action == "BUY":
@@ -394,10 +388,6 @@ def pips_between(price_a: float, price_b: float) -> int:
 
 
 def generate_alert_chart(candles: list, action: str, entry_price: float, levels: list, stop_loss: float) -> str:
-    """Graphique en chandelles (style MT5) des bougies récentes, avec
-    l'entrée, les paliers P1-P6 et le SL repérés. Les niveaux trop loin du
-    prix actuel pour tenir dans le cadre sont résumés en note compacte
-    plutôt que d'étirer l'axe et d'écraser les bougies."""
     window = candles[-CHART_CANDLE_COUNT:] if len(candles) >= CHART_CANDLE_COUNT else candles
 
     df = pd.DataFrame(
@@ -534,8 +524,6 @@ def close_previous_trade_if_open(open_trade, current_price: float, current_candl
 
 
 def check_open_trade(candles: list, open_trade: dict):
-    """Suit la position ouverte : paliers P1..P6 touchés dans l'ordre, puis SL.
-    Quand tous les paliers sont atteints, la position est considérée terminée."""
     if open_trade is None or open_trade.get("closed"):
         return [], open_trade, []
 
@@ -706,9 +694,6 @@ def generate_summary_image(week_id: str, trades: list) -> str:
 
 
 def classify_signal(doc: dict):
-    """Reprend la même logique honnête que stats.html : une position ne
-    compte comme 'gagnante' que si elle n'a jamais touché le SL. Renvoie
-    (pips_realises, resultat, est_cloturee)."""
     levels = doc.get("levels") or []
     levels_hit = doc.get("levels_hit") or []
     entry = doc.get("entry")
@@ -757,7 +742,6 @@ def generate_monthly_summary_image(month_id: str, signals: list) -> str:
     total_pips = sum(c["pips"] for c in closed)
     win_rate = (n_wins / n_total * 100) if n_total else 0
 
-    # Meilleur / pire jour : on cumule les pips réalisés par jour d'ouverture.
     by_day = {}
     for c in closed:
         by_day.setdefault(c["day"], 0)
@@ -765,7 +749,6 @@ def generate_monthly_summary_image(month_id: str, signals: list) -> str:
     best_day = max(by_day.items(), key=lambda kv: kv[1]) if by_day else None
     worst_day = min(by_day.items(), key=lambda kv: kv[1]) if by_day else None
 
-    # Tendance semaine par semaine dans le mois (buckets de 7 jours calendaires).
     buckets = {}
     for c in closed:
         try:
@@ -902,40 +885,6 @@ def check_and_send_monthly_summary(state: dict) -> bool:
     return sent
 
 
-
-    now = datetime.now(timezone.utc)
-    is_closing_time = now.weekday() == WEEKLY_SUMMARY_WEEKDAY and now.hour >= WEEKLY_SUMMARY_HOUR_UTC
-    if not is_closing_time:
-        return False
-
-    week_id = get_week_id(now)
-    if state.get("last_summary_week") == week_id:
-        return False
-
-    trades = state.get("weekly_trades", [])
-    log(f"Clôture hebdomadaire détectée ({week_id}) — génération du bilan ({len(trades)} événements).")
-
-    image_path = generate_summary_image(week_id, trades)
-    total_pips = sum((t["pips"] if isinstance(t, dict) else t[1]) for t in trades)
-    total_eur = total_pips * PIP_VALUE_EUR_PER_001_LOT
-    sign = "+" if total_pips >= 0 else ""
-
-    total_all_time = state.get("total_pips_all_time", 0)
-    sign_all = "+" if total_all_time >= 0 else ""
-
-    caption = (
-        f"📊 <b>Bilan de la semaine {week_id}</b>\n"
-        f"Résultat cumulé : {sign}{total_pips} pips (~{sign}{total_eur:.0f}€ en 0.01 lot)\n"
-        f"Total depuis le lancement : {sign_all}{total_all_time} pips"
-    )
-    sent = send_photo(image_path, caption)
-    log(f"Bilan hebdomadaire envoyé : {sent}")
-
-    state["last_summary_week"] = week_id
-    state["weekly_trades"] = []
-    return True
-
-
 def format_daily_briefing(current_price: float, short_sma: float, long_sma: float, rsi: float, atr: float) -> str:
     trend = "haussière 🟢" if short_sma > long_sma else "baissière 🔴"
     if rsi >= RSI_OVERBOUGHT:
@@ -984,8 +933,6 @@ def run_once():
 
     log("Secrets bien reçus (BOT_TOKEN, CHANNEL_ID, TWELVEDATA_API_KEY présents).")
 
-    # Vérifie la connexion Firestore dès le départ (log de confirmation),
-    # même si aucun signal n'est envoyé cette fois-ci.
     get_firestore_db()
 
     state = load_state()
@@ -1007,12 +954,6 @@ def run_once():
         f"position ouverte={'oui' if open_trade and not open_trade.get('closed') else 'non'}, "
         f"événements cette semaine={len(weekly_trades)}, cooldown restant={cooldown_candles_remaining}, "
         f"total all-time={total_pips_all_time}, alertes aujourd'hui={alerts_sent_today}/{DAILY_SIGNAL_LIMIT}")
-
-    summary_sent = check_and_send_weekly_summary(state)
-    if summary_sent:
-        save_state(state)
-        log("=== Fin de la vérification (bilan hebdomadaire envoyé) ===")
-        return
 
     monthly_sent = check_and_send_monthly_summary(state)
     if monthly_sent:
