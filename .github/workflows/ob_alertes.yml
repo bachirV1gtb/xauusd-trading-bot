@@ -1,39 +1,37 @@
 name: Alertes Order Blocks
-
 on:
   schedule:
-    - cron: "2,17,32,47 * * * *"   # toutes les 15 min, juste après chaque clôture 15 min
+    - cron: "7 * * * *"
   workflow_dispatch:
     inputs:
       test:
         description: "Envoyer une image de test maintenant (1 = oui)"
-        default: "1"
-
+        default: "0"
 permissions:
   contents: write
-
-concurrency: ob-alertes
-
+concurrency:
+  group: ob-alertes
+  cancel-in-progress: false
 jobs:
   alertes:
     runs-on: ubuntu-latest
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install pandas numpy matplotlib requests yfinance
-      - name: Détection et envoi Telegram
-        run: python ob_alertes.py
+      - name: Identite git
+        run: |
+          git config user.name "ob-alertes-bot"
+          git config user.email "ob-alertes-bot@users.noreply.github.com"
+      - name: Surveillance en continu
+        run: python -u ob_alertes.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.CHANNEL_ID }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           MIN_STARS: "2"
+          DUREE_MIN: "345"
           TEST_MODE: ${{ github.event.inputs.test == '1' && '1' || '0' }}
-      - name: Sauvegarder les alertes déjà envoyées
-        run: |
-          git config user.name "ob-alertes-bot"
-          git config user.email "ob-alertes-bot@users.noreply.github.com"
-          git add ob_state.json || true
-          git diff --cached --quiet || (git commit -m "MAJ alertes OB" && git pull --rebase && git push)
