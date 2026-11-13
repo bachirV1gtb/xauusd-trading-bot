@@ -415,7 +415,7 @@ def load_state():
         with open(STATE_FILE, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"sent": [], "init": False}
+        return {"sent": [], "last": {}}
 
 
 def analyse(df15):
@@ -437,12 +437,35 @@ def analyse(df15):
     return res
 
 
-def main():
-    state = load_state()
-    sent = set(state.get("sent", []))
-    first_run = not state.get("init", False)
-    erreurs = 0
+def git_sauvegarde(msg):
+    """Enregistre ob_state.json dans le dépôt (pour ne jamais renvoyer la même alerte)."""
+    import subprocess
+    if not os.getenv("GITHUB_ACTIONS"):
+        return
+    d = os.path.dirname(STATE_FILE)
+    run = lambda *a: subprocess.run(["git", "-C", d, *a], capture_output=True, text=True)
+    run("add", "ob_state.json")
+    if run("diff", "--cached", "--quiet").returncode == 0:
+        return
+    run("commit", "-m", msg)
+    for _ in range(3):
+        run("pull", "--rebase", "-X", "theirs")
+        if run("push").returncode == 0:
+            return
+    print("  (sauvegarde git impossible pour l'instant)")
 
+
+def save_state(state):
+    state["sent"] = sorted(state["sent"])[-1500:]
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
+
+
+def passage(state):
+    """Un contrôle complet des marchés. Renvoie le nombre d'alertes envoyées."""
+    sent = set(state["sent"])
+    nb = 0
+    erreurs = 0
     for m in MARCHES:
         try:
             df15 = fetch_15m(m)
@@ -456,8 +479,8 @@ def main():
         res = analyse(df15)
         end15 = df15.index[-1] + STEP["M15"]
         last_price = df15["close"].iloc[-1]
-        print(f"[{m['name']}] dernière bougie 15 min clôturée à {end15} | "
-              + ", ".join(f"{tf}: {len(res[tf]['obs'])} OB" for tf in TFS))
+        print(f"[{datetime.now(timezone.utc):%H:%M}] [{m['name']}] dernière bougie 15 min clôturée à "
+              f"{end15:%d/%m %H:%M} UTC | " + ", ".join(f"{tf}: {len(res[tf]['obs'])} OB" for tf in TFS))
 
         if TEST_MODE:
             for tf in TFS:
@@ -468,7 +491,14 @@ def main():
                                f"Pointillés = zones des timeframes supérieures")
             continue
 
-        limite = end15 - (STEP["M15"] if first_run else FENETRE)
+        # tout ce qui s'est passé depuis le dernier contrôle (au plus 45 min en arrière)
+        dernier = state["last"].get(m["name"])
+        limite = end15 - FENETRE
+        if dernier:
+            limite = max(limite, pd.Timestamp(dernier))
+        else:
+            limite = end15 - STEP["M15"]
+
         # 1) order blocks qui viennent d'être CRÉÉS
         for tf in TFS:
             for ob in res[tf]["obs"]:
@@ -480,6 +510,7 @@ def main():
                     continue
                 send_photo(draw(res, tf, m, focus=ob, mode="new"), message_new(ob, tf, born_time, last_price, m))
                 sent.add(key)
+                nb += 1
                 print("  nouvel OB envoyé :", key)
         # 2) order blocks TOUCHÉS
         for tf in TFS:
@@ -491,14 +522,47 @@ def main():
                     continue
                 send_photo(draw(res, tf, m, focus=ob), message(ob, tf, last_price, m))
                 sent.add(key)
+                nb += 1
                 print("  alerte envoyée :", key)
+        state["last"][m["name"]] = end15.isoformat()
 
-    if not TEST_MODE:
-        state = {"sent": sorted(sent)[-1500:], "init": True}
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=1)
+    state["sent"] = list(sent)
     if erreurs == len(MARCHES):
-        sys.exit(1)
+        raise RuntimeError("aucune donnée disponible")
+    return nb
+
+
+def main():
+    """Reste allumé DUREE_MIN minutes et contrôle les marchés juste après chaque clôture 15 min."""
+    import time
+    duree = float(os.getenv("DUREE_MIN", "0")) * 60
+    debut = time.time()
+    state = load_state()
+    state.setdefault("last", {})
+    state.setdefault("sent", [])
+    echecs = 0
+    while True:
+        try:
+            nb = passage(state)
+            echecs = 0
+            if not TEST_MODE:
+                save_state(state)
+                if nb:
+                    git_sauvegarde(f"MAJ alertes OB (+{nb})")
+        except Exception as e:  # noqa: BLE001
+            echecs += 1
+            print("Erreur pendant le contrôle :", e)
+            if echecs >= 5 or not duree:
+                raise
+        if TEST_MODE or not duree or time.time() - debut > duree:
+            break
+        # prochain contrôle : 40 s après la prochaine clôture de bougie 15 min
+        now = time.time()
+        prochain = (now // 900 + 1) * 900 + 40
+        time.sleep(max(5, prochain - now))
+    if not TEST_MODE:
+        save_state(state)
+        git_sauvegarde("MAJ alertes OB")
 
 
 if __name__ == "__main__":
