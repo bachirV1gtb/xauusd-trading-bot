@@ -2,7 +2,7 @@ name: Alertes Order Blocks
 
 on:
   schedule:
-    - cron: "3 * * * *"   # chaque heure, 3 min après la clôture de la bougie 1H
+    - cron: "2,17,32,47 * * * *"   # toutes les 15 min, juste après chaque clôture 15 min
   workflow_dispatch:
     inputs:
       test:
