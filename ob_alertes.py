@@ -36,9 +36,10 @@ import requests
 
 # ─── RÉGLAGES ────────────────────────────────────────────────────
 MARCHES = [
-    # name = nom affiché | td = symbole TwelveData | yf = symbole Yahoo (secours) | dec = décimales
+    # name = nom affiché | td = symbole TwelveData | hl = marché Hyperliquid (temps réel)
+    # yf = symbole Yahoo (secours) | dec = décimales
     {"name": "XAU/USD", "td": "XAU/USD", "yf": "GC=F", "dec": 2},
-    {"name": "NAS100",  "td": None,      "yf": "NQ=F", "dec": 1},
+    {"name": "NAS100",  "td": None, "hl": "xyz:XYZ100", "yf": "NQ=F", "dec": 1},
 ]
 TFS = ["M15", "H1", "D1"]
 STEP = {"M15": timedelta(minutes=15), "H1": timedelta(hours=1), "D1": timedelta(days=1)}
@@ -99,9 +100,36 @@ def fetch_yahoo(symbol):
     return df.sort_index()
 
 
+def fetch_hyperliquid(coin):
+    """Nasdaq 100 en temps réel (marché xyz:XYZ100 de Hyperliquid), gratuit et sans clé."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    r = requests.post("https://api.hyperliquid.xyz/info", timeout=30, json={
+        "type": "candleSnapshot",
+        "req": {"coin": coin, "interval": "15m", "startTime": now_ms - 60 * 86400 * 1000, "endTime": now_ms}})
+    k = r.json()
+    if not isinstance(k, list) or not k:
+        raise RuntimeError(f"Hyperliquid {coin} : {k}")
+    df = pd.DataFrame(k)
+    df["time"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    df = df.set_index("time")[["open", "high", "low", "close", "volume"]].astype(float).sort_index()
+    # on garde seulement les heures où le NAS100 de ton courtier est ouvert
+    ny = df.index.tz_convert("America/New_York")
+    ferme = (ny.dayofweek == 5) | ((ny.dayofweek == 4) & (ny.hour >= 17)) | \
+            ((ny.dayofweek == 6) & (ny.hour < 18)) | (ny.hour == 17)
+    return df[~ferme]
+
+
 def fetch_15m(m):
     """Bougies 15 min CLÔTURÉES."""
-    df = fetch_twelvedata(m["td"]) if (m["td"] and TD_KEY) else fetch_yahoo(m["yf"])
+    df = None
+    if m.get("hl"):
+        try:
+            df = fetch_hyperliquid(m["hl"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[{m['name']}] Hyperliquid indisponible ({e}), secours Yahoo")
+    if df is None:
+        df = fetch_twelvedata(m["td"]) if (m["td"] and TD_KEY) else fetch_yahoo(m["yf"])
     now = datetime.now(timezone.utc)
     df = df[df.index + STEP["M15"] <= now]
     return df[~df.index.duplicated(keep="last")].dropna()
@@ -231,7 +259,7 @@ def stars_txt(s):
     return "★" * s + "☆" * (5 - s)
 
 
-def draw(res, tf, m, focus=None):
+def draw(res, tf, m, focus=None, mode="touch"):
     dec = m["dec"]
     df, disp_df, obs = res[tf]["closed"], res[tf]["disp"], res[tf]["obs"]
     n_disp = len(disp_df)
@@ -243,6 +271,8 @@ def draw(res, tf, m, focus=None):
     fig, ax = plt.subplots(figsize=(12, 6.75), dpi=110)
     fig.patch.set_facecolor(BG); ax.set_facecolor(BG)
     lo_y, hi_y = d["low"].min(), d["high"].max()
+    if focus is not None:                      # la zone concernée est toujours visible
+        lo_y, hi_y = min(lo_y, focus["bot"]), max(hi_y, focus["top"])
     pad = (hi_y - lo_y) * 0.08
     y0, y1 = lo_y - pad, hi_y + pad
 
@@ -295,7 +325,12 @@ def draw(res, tf, m, focus=None):
                                facecolor=colc, edgecolor=colc, linewidth=0.5, zorder=4))
     ax.plot(np.arange(nb), ema, color=EMA_COL, linewidth=1.3, zorder=2)
 
-    if focus is not None and "touch_idx" in focus and focus["touch_idx"] >= s0:
+    if focus is not None and mode == "new" and focus["born"] >= s0:
+        xi = focus["start"] - s0
+        y = focus["bot"] - pad * 0.45 if focus["bull"] else focus["top"] + pad * 0.45
+        ax.text(max(xi, 0), y, "NOUVEL ORDER BLOCK", color="#ff6d00", fontsize=9, fontweight="bold",
+                ha="left", va="top" if focus["bull"] else "bottom", zorder=6)
+    elif focus is not None and "touch_idx" in focus and focus["touch_idx"] >= s0:
         xi = focus["touch_idx"] - s0
         if focus["bull"]:
             ax.annotate("TOUCHÉ", (xi, d["low"].iloc[xi]), xytext=(xi, d["low"].iloc[xi] - pad * 0.5),
@@ -360,6 +395,20 @@ def message(ob, tf, last_price, m):
             f"<i>Ceci n'est pas un conseil financier.</i>")
 
 
+def message_new(ob, tf, born_time, last_price, m):
+    dec = m["dec"]
+    t = born_time.tz_convert(PARIS)
+    sens = "🆕🟢 <b>NOUVEL ORDER BLOCK ACHETEUR</b>" if ob["bull"] else "🆕🔴 <b>NOUVEL ORDER BLOCK VENDEUR</b>"
+    return (f"{sens}\n\n"
+            f"📊 <b>{m['name']}</b> · <b>{NOM_TF[tf]}</b>\n"
+            f"📍 Zone : <b>{ob['top']:.{dec}f} - {ob['bot']:.{dec}f}</b>\n"
+            f"⭐ Qualité : {stars_txt(ob['stars'])} ({ob['stars']}/5)\n"
+            f"💰 Prix actuel : {last_price:.{dec}f}\n"
+            f"🕐 Créé le {t.strftime('%d/%m à %Hh%M')} (Paris)\n\n"
+            f"👀 En attente d'un retour du prix dans la zone.\n"
+            f"<i>Ceci n'est pas un conseil financier.</i>")
+
+
 # ─── PROGRAMME PRINCIPAL ─────────────────────────────────────────
 def load_state():
     try:
@@ -420,6 +469,19 @@ def main():
             continue
 
         limite = end15 - (STEP["M15"] if first_run else FENETRE)
+        # 1) order blocks qui viennent d'être CRÉÉS
+        for tf in TFS:
+            for ob in res[tf]["obs"]:
+                born_time = res[tf]["closed"].index[ob["born"]] + STEP[tf]
+                if ob["stars"] < MIN_STARS or born_time <= limite:
+                    continue
+                key = f"C|{m['name']}|{tf}|{res[tf]['closed'].index[ob['start']].isoformat()}|{'B' if ob['bull'] else 'S'}"
+                if key in sent:
+                    continue
+                send_photo(draw(res, tf, m, focus=ob, mode="new"), message_new(ob, tf, born_time, last_price, m))
+                sent.add(key)
+                print("  nouvel OB envoyé :", key)
+        # 2) order blocks TOUCHÉS
         for tf in TFS:
             for ob in res[tf]["obs"]:
                 if "touch_time" not in ob or ob["stars"] < MIN_STARS or ob["touch_time"] <= limite:
@@ -432,7 +494,7 @@ def main():
                 print("  alerte envoyée :", key)
 
     if not TEST_MODE:
-        state = {"sent": sorted(sent)[-500:], "init": True}
+        state = {"sent": sorted(sent)[-1500:], "init": True}
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=1)
     if erreurs == len(MARCHES):
